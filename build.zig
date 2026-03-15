@@ -4,19 +4,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const zeke_mod = b.createModule(.{
+    // Expose as a named module so dependents can do:
+    //   b.dependency("zeke", .{}).module("zeke")
+    const zeke_mod = b.addModule("zeke", .{
         .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
     });
-
-    // Library
-    const lib = b.addLibrary(.{
-        .name = "zeke",
-        .linkage = .static,
-        .root_module = zeke_mod,
-    });
-    b.installArtifact(lib);
 
     // Tests
     const test_step = b.step("test", "Run unit tests");
