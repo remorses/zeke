@@ -528,3 +528,120 @@ test "bind validates action signature" {
     const Bound = Serve.bind(action);
     try std.testing.expect(@TypeOf(Bound.invoke) == fn (Bound.Args, Bound.Options) anyerror!void);
 }
+
+test "parseCommandParts: empty name (default command)" {
+    const parsed = comptime parseCommandParts("");
+    try std.testing.expectEqual(@as(usize, 0), parsed.name_parts.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.arg_specs.len);
+}
+
+test "parseCommandParts: three-level subcommand with args" {
+    const parsed = comptime parseCommandParts("git remote add <name> <url>");
+    try std.testing.expectEqual(@as(usize, 3), parsed.name_parts.len);
+    try std.testing.expectEqualStrings("git", parsed.name_parts[0]);
+    try std.testing.expectEqualStrings("remote", parsed.name_parts[1]);
+    try std.testing.expectEqualStrings("add", parsed.name_parts[2]);
+    try std.testing.expectEqual(@as(usize, 2), parsed.arg_specs.len);
+    try std.testing.expect(parsed.arg_specs[0].required);
+    try std.testing.expect(parsed.arg_specs[1].required);
+    try std.testing.expectEqualStrings("name", parsed.arg_specs[0].name);
+    try std.testing.expectEqualStrings("url", parsed.arg_specs[1].name);
+}
+
+test "parseCommandParts: mixed required and optional args" {
+    const parsed = comptime parseCommandParts("convert <input> [output]");
+    try std.testing.expectEqual(@as(usize, 1), parsed.name_parts.len);
+    try std.testing.expectEqual(@as(usize, 2), parsed.arg_specs.len);
+    try std.testing.expect(parsed.arg_specs[0].required);
+    try std.testing.expect(!parsed.arg_specs[1].required);
+}
+
+test "parseCommandParts: required variadic arg" {
+    const parsed = comptime parseCommandParts("rm <...paths>");
+    try std.testing.expectEqual(@as(usize, 1), parsed.arg_specs.len);
+    try std.testing.expectEqualStrings("paths", parsed.arg_specs[0].name);
+    try std.testing.expect(parsed.arg_specs[0].variadic);
+    try std.testing.expect(parsed.arg_specs[0].required);
+}
+
+test "parseOptionSpec: short alias with optional value" {
+    const spec = comptime parseOptionSpec("-o, --output [path]", "Output path");
+    try std.testing.expectEqualStrings("output", spec.field_name);
+    try std.testing.expectEqualStrings("output", spec.long_name);
+    try std.testing.expectEqual(@as(u8, 'o'), spec.short);
+    try std.testing.expectEqual(OptionKind.optional, spec.kind);
+}
+
+test "parseOptionSpec: multi-hyphen kebab name" {
+    const spec = comptime parseOptionSpec("--no-emit-on-error", "Suppress output on errors");
+    try std.testing.expectEqualStrings("no_emit_on_error", spec.field_name);
+    try std.testing.expectEqualStrings("no-emit-on-error", spec.long_name);
+    try std.testing.expectEqual(OptionKind.flag, spec.kind);
+}
+
+test "buildArgsType: variadic arg produces slice type" {
+    const specs = [_]ArgSpec{
+        .{ .name = "files", .required = false, .variadic = true },
+    };
+    const T = buildArgsType(&specs);
+    try std.testing.expect(@TypeOf(@as(T, undefined).files) == []const []const u8);
+}
+
+test "buildOptionsType: empty specs produces empty struct" {
+    const specs = [_]OptionSpec{};
+    const T = buildOptionsType(&specs);
+    const info = @typeInfo(T).@"struct";
+    try std.testing.expectEqual(@as(usize, 0), info.fields.len);
+}
+
+test "cmd no options produces empty Options struct" {
+    const Ping = cmd("ping <host>", "Ping a host");
+    const info = @typeInfo(Ping.Options).@"struct";
+    try std.testing.expectEqual(@as(usize, 0), info.fields.len);
+    // Args should have one required field
+    try std.testing.expect(@TypeOf(@as(Ping.Args, undefined).host) == []const u8);
+}
+
+test "cmd with example preserves examples" {
+    const Serve = cmd("serve", "Start server")
+        .option("--port <port>", "Port")
+        .example("myapp serve --port 3000")
+        .example("myapp serve --port 8080");
+    try std.testing.expectEqual(@as(usize, 2), Serve.command_examples.len);
+    try std.testing.expectEqualStrings("myapp serve --port 3000", Serve.command_examples[0]);
+    try std.testing.expectEqualStrings("myapp serve --port 8080", Serve.command_examples[1]);
+}
+
+test "cmd default command has zero name parts" {
+    const Root = cmd("", "Default command")
+        .option("--verbose", "Verbose");
+    try std.testing.expectEqual(@as(usize, 0), Root.command_name_parts.len);
+    try std.testing.expectEqualStrings("", Root.command_raw_name);
+    try std.testing.expect(@TypeOf(@as(Root.Options, undefined).verbose) == bool);
+}
+
+test "cmd preserves description and raw name" {
+    const Cmd = cmd("deploy <env>", "Deploy to an environment")
+        .option("--force", "Skip confirmation");
+    try std.testing.expectEqualStrings("deploy <env>", Cmd.command_raw_name);
+    try std.testing.expectEqualStrings("Deploy to an environment", Cmd.command_description);
+}
+
+test "bound command preserves all metadata" {
+    const Cmd = cmd("mcp login <url>", "Login to MCP server")
+        .option("--token [token]", "Auth token")
+        .example("myapp mcp login https://example.com");
+
+    const noop = struct {
+        fn f(_: Cmd.Args, _: Cmd.Options) !void {}
+    }.f;
+    const Bound = Cmd.bind(noop);
+
+    try std.testing.expectEqual(@as(usize, 2), Bound.command_name_parts.len);
+    try std.testing.expectEqualStrings("mcp", Bound.command_name_parts[0]);
+    try std.testing.expectEqualStrings("login", Bound.command_name_parts[1]);
+    try std.testing.expectEqual(@as(usize, 1), Bound.command_arg_specs.len);
+    try std.testing.expectEqualStrings("url", Bound.command_arg_specs[0].name);
+    try std.testing.expectEqual(@as(usize, 1), Bound.command_opt_specs.len);
+    try std.testing.expectEqual(@as(usize, 1), Bound.command_examples.len);
+}

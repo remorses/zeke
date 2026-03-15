@@ -826,7 +826,279 @@ test "help: short aliases displayed in options" {
     , help);
 }
 
-// ─── Parsing tests ───
+// ─── Dispatch tests ───
+
+test "dispatch: matches command and passes args/options" {
+    const Greet = builder.cmd("greet <name>", "Greet someone")
+        .option("--loud", "Shout");
+
+    var called_name: []const u8 = "";
+    var called_loud: bool = false;
+
+    const action = struct {
+        var name_ptr: *[]const u8 = undefined;
+        var loud_ptr: *bool = undefined;
+        fn f(args: Greet.Args, opts: Greet.Options) !void {
+            name_ptr.* = args.name;
+            loud_ptr.* = opts.loud;
+        }
+    };
+    action.name_ptr = &called_name;
+    action.loud_ptr = &called_loud;
+
+    var app = App(.{Greet.bind(action.f)}).init(std.testing.allocator, "test");
+    try app.dispatch(&.{ "greet", "World", "--loud" });
+
+    try std.testing.expectEqualStrings("World", called_name);
+    try std.testing.expect(called_loud);
+}
+
+test "dispatch: longest match wins for space-separated commands" {
+    const Base = builder.cmd("mcp", "MCP base");
+    const Login = builder.cmd("mcp login", "MCP login");
+
+    var matched: []const u8 = "";
+
+    const action_base = struct {
+        var ptr: *[]const u8 = undefined;
+        fn f(_: Base.Args, _: Base.Options) !void {
+            ptr.* = "base";
+        }
+    };
+    const action_login = struct {
+        var ptr: *[]const u8 = undefined;
+        fn f(_: Login.Args, _: Login.Options) !void {
+            ptr.* = "login";
+        }
+    };
+    action_base.ptr = &matched;
+    action_login.ptr = &matched;
+
+    var app = App(.{
+        Base.bind(action_base.f),
+        Login.bind(action_login.f),
+    }).init(std.testing.allocator, "test");
+
+    try app.dispatch(&.{ "mcp", "login" });
+    try std.testing.expectEqualStrings("login", matched);
+
+    try app.dispatch(&.{"mcp"});
+    try std.testing.expectEqualStrings("base", matched);
+}
+
+test "dispatch: default command runs when no args" {
+    const Root = builder.cmd("", "Default");
+
+    var called = false;
+    const action = struct {
+        var ptr: *bool = undefined;
+        fn f(_: Root.Args, _: Root.Options) !void {
+            ptr.* = true;
+        }
+    };
+    action.ptr = &called;
+
+    var app = App(.{Root.bind(action.f)}).init(std.testing.allocator, "test");
+    try app.dispatch(&.{});
+    try std.testing.expect(called);
+}
+
+test "dispatch: default command receives options" {
+    const Root = builder.cmd("", "Default")
+        .option("--env <env>", "Environment");
+
+    var env_val: []const u8 = "";
+    const action = struct {
+        var ptr: *[]const u8 = undefined;
+        fn f(_: Root.Args, opts: Root.Options) !void {
+            ptr.* = opts.env;
+        }
+    };
+    action.ptr = &env_val;
+
+    var app = App(.{Root.bind(action.f)}).init(std.testing.allocator, "test");
+    try app.dispatch(&.{ "--env", "staging" });
+    try std.testing.expectEqualStrings("staging", env_val);
+}
+
+test "dispatch: named command takes priority over default" {
+    const Root = builder.cmd("", "Default");
+    const Status = builder.cmd("status", "Show status");
+
+    var matched: []const u8 = "";
+    const action_root = struct {
+        var ptr: *[]const u8 = undefined;
+        fn f(_: Root.Args, _: Root.Options) !void {
+            ptr.* = "root";
+        }
+    };
+    const action_status = struct {
+        var ptr: *[]const u8 = undefined;
+        fn f(_: Status.Args, _: Status.Options) !void {
+            ptr.* = "status";
+        }
+    };
+    action_root.ptr = &matched;
+    action_status.ptr = &matched;
+
+    var app = App(.{
+        Root.bind(action_root.f),
+        Status.bind(action_status.f),
+    }).init(std.testing.allocator, "test");
+
+    try app.dispatch(&.{"status"});
+    try std.testing.expectEqualStrings("status", matched);
+}
+
+test "dispatch: unknown option returns error" {
+    const Serve = builder.cmd("serve", "Start server")
+        .option("--port <port>", "Port");
+    const noop = struct {
+        fn f(_: Serve.Args, _: Serve.Options) !void {}
+    }.f;
+
+    var app = App(.{Serve.bind(noop)}).init(std.testing.allocator, "test");
+    const result = app.dispatch(&.{ "serve", "--unknown" });
+    try std.testing.expectError(error.ParseError, result);
+}
+
+test "dispatch: missing required option value returns error" {
+    const Serve = builder.cmd("serve", "Start server")
+        .option("--port <port>", "Port");
+    const noop = struct {
+        fn f(_: Serve.Args, _: Serve.Options) !void {}
+    }.f;
+
+    var app = App(.{Serve.bind(noop)}).init(std.testing.allocator, "test");
+    const result = app.dispatch(&.{ "serve", "--port" });
+    try std.testing.expectError(error.ParseError, result);
+}
+
+test "dispatch: missing required arg returns error" {
+    const Press = builder.cmd("press <key>", "Press key");
+    const noop = struct {
+        fn f(_: Press.Args, _: Press.Options) !void {}
+    }.f;
+
+    var app = App(.{Press.bind(noop)}).init(std.testing.allocator, "test");
+    const result = app.dispatch(&.{"press"});
+    try std.testing.expectError(error.MissingRequiredArg, result);
+}
+
+// Note: --help and --version tests are omitted from unit tests because
+// dispatch() writes to real stdout which can block in test runners.
+// These paths are covered by the help output snapshot tests above
+// (helpString) and by the example binary integration tests.
+
+// ─── parseOptions tests (additional) ───
+
+test "parseOptions: empty argv" {
+    const specs = [_]OptionSpec{
+        .{ .field_name = "watch", .long_name = "watch", .short = 0, .kind = .flag, .description = "", .raw = "" },
+    };
+    const OptsType = builder.buildOptionsType(&specs);
+    const argv = [_][]const u8{};
+    const result = parseOptions(OptsType, &specs, &argv);
+
+    try std.testing.expect(!result.opts.watch);
+    try std.testing.expectEqual(@as(usize, 0), result.positional.len);
+    try std.testing.expect(result.err == null);
+}
+
+test "parseOptions: no specs, all positional" {
+    const specs = [_]OptionSpec{};
+    const OptsType = builder.buildOptionsType(&specs);
+    const argv = [_][]const u8{ "foo", "bar", "baz" };
+    const result = parseOptions(OptsType, &specs, &argv);
+
+    try std.testing.expectEqual(@as(usize, 3), result.positional.len);
+    try std.testing.expectEqualStrings("foo", result.positional[0]);
+    try std.testing.expectEqualStrings("baz", result.positional[2]);
+}
+
+test "parseOptions: required option missing value" {
+    const specs = [_]OptionSpec{
+        .{ .field_name = "port", .long_name = "port", .short = 0, .kind = .required, .description = "", .raw = "--port <port>" },
+    };
+    const OptsType = builder.buildOptionsType(&specs);
+    const argv = [_][]const u8{"--port"};
+    const result = parseOptions(OptsType, &specs, &argv);
+
+    try std.testing.expect(result.err != null);
+    try std.testing.expectEqual(.missing_value, result.err.?.kind);
+}
+
+test "parseOptions: optional flag without value stays null" {
+    const specs = [_]OptionSpec{
+        .{ .field_name = "format", .long_name = "format", .short = 0, .kind = .optional, .description = "", .raw = "" },
+    };
+    const OptsType = builder.buildOptionsType(&specs);
+    const argv = [_][]const u8{"--format"};
+    const result = parseOptions(OptsType, &specs, &argv);
+
+    try std.testing.expect(result.err == null);
+    try std.testing.expectEqual(@as(?[]const u8, null), result.opts.format);
+}
+
+test "parseOptions: optional flag with value" {
+    const specs = [_]OptionSpec{
+        .{ .field_name = "format", .long_name = "format", .short = 0, .kind = .optional, .description = "", .raw = "" },
+    };
+    const OptsType = builder.buildOptionsType(&specs);
+    const argv = [_][]const u8{ "--format", "json" };
+    const result = parseOptions(OptsType, &specs, &argv);
+
+    try std.testing.expect(result.err == null);
+    try std.testing.expectEqualStrings("json", result.opts.format.?);
+}
+
+test "parseOptions: mixed positional and options" {
+    const specs = [_]OptionSpec{
+        .{ .field_name = "verbose", .long_name = "verbose", .short = 0, .kind = .flag, .description = "", .raw = "" },
+        .{ .field_name = "out", .long_name = "out", .short = 0, .kind = .required, .description = "", .raw = "" },
+    };
+    const OptsType = builder.buildOptionsType(&specs);
+    const argv = [_][]const u8{ "input.txt", "--verbose", "--out", "output.txt", "extra" };
+    const result = parseOptions(OptsType, &specs, &argv);
+
+    try std.testing.expect(result.err == null);
+    try std.testing.expect(result.opts.verbose);
+    try std.testing.expectEqualStrings("output.txt", result.opts.out);
+    try std.testing.expectEqual(@as(usize, 2), result.positional.len);
+    try std.testing.expectEqualStrings("input.txt", result.positional[0]);
+    try std.testing.expectEqualStrings("extra", result.positional[1]);
+}
+
+test "parseOptions: unknown short option returns error" {
+    const specs = [_]OptionSpec{
+        .{ .field_name = "port", .long_name = "port", .short = 'p', .kind = .required, .description = "", .raw = "" },
+    };
+    const OptsType = builder.buildOptionsType(&specs);
+    const argv = [_][]const u8{"-z"};
+    const result = parseOptions(OptsType, &specs, &argv);
+
+    try std.testing.expect(result.err != null);
+    try std.testing.expectEqual(.unknown_option, result.err.?.kind);
+    try std.testing.expectEqualStrings("-z", result.err.?.token);
+}
+
+test "parseOptions: double dash stops option parsing" {
+    const specs = [_]OptionSpec{
+        .{ .field_name = "verbose", .long_name = "verbose", .short = 0, .kind = .flag, .description = "", .raw = "" },
+    };
+    const OptsType = builder.buildOptionsType(&specs);
+    // --verbose after -- should NOT be parsed as a flag
+    const argv = [_][]const u8{ "--", "--verbose", "arg" };
+    const result = parseOptions(OptsType, &specs, &argv);
+
+    try std.testing.expect(!result.opts.verbose);
+    try std.testing.expectEqual(@as(usize, 0), result.positional.len);
+    try std.testing.expectEqual(@as(usize, 2), result.double_dash.len);
+    try std.testing.expectEqualStrings("--verbose", result.double_dash[0]);
+    try std.testing.expectEqualStrings("arg", result.double_dash[1]);
+}
+
+// ─── fillArgs tests (additional) ───
 
 test "fillArgs: required and optional" {
     const specs = [_]ArgSpec{
@@ -850,4 +1122,145 @@ test "fillArgs: required and optional" {
     const positional3 = [_][]const u8{};
     const args3 = fillArgs(ArgsType, &specs, &positional3);
     try std.testing.expect(args3 == null);
+}
+
+test "fillArgs: variadic collects remaining args" {
+    const specs = [_]ArgSpec{
+        .{ .name = "cmd", .required = true, .variadic = false },
+        .{ .name = "rest", .required = false, .variadic = true },
+    };
+    const ArgsType = builder.buildArgsType(&specs);
+
+    const positional = [_][]const u8{ "run", "a", "b", "c" };
+    const args = fillArgs(ArgsType, &specs, &positional);
+    try std.testing.expect(args != null);
+    try std.testing.expectEqualStrings("run", args.?.cmd);
+    try std.testing.expectEqual(@as(usize, 3), args.?.rest.len);
+    try std.testing.expectEqualStrings("a", args.?.rest[0]);
+    try std.testing.expectEqualStrings("c", args.?.rest[2]);
+}
+
+test "fillArgs: variadic with no remaining args" {
+    const specs = [_]ArgSpec{
+        .{ .name = "files", .required = false, .variadic = true },
+    };
+    const ArgsType = builder.buildArgsType(&specs);
+
+    const positional = [_][]const u8{};
+    const args = fillArgs(ArgsType, &specs, &positional);
+    try std.testing.expect(args != null);
+    try std.testing.expectEqual(@as(usize, 0), args.?.files.len);
+}
+
+test "fillArgs: empty specs, no args needed" {
+    const specs = [_]ArgSpec{};
+    const ArgsType = builder.buildArgsType(&specs);
+
+    const positional = [_][]const u8{};
+    const args = fillArgs(ArgsType, &specs, &positional);
+    try std.testing.expect(args != null);
+}
+
+test "fillArgs: extra positional args ignored" {
+    const specs = [_]ArgSpec{
+        .{ .name = "name", .required = true, .variadic = false },
+    };
+    const ArgsType = builder.buildArgsType(&specs);
+
+    // Extra positional "extra" is silently ignored
+    const positional = [_][]const u8{ "hello", "extra" };
+    const args = fillArgs(ArgsType, &specs, &positional);
+    try std.testing.expect(args != null);
+    try std.testing.expectEqualStrings("hello", args.?.name);
+}
+
+// ─── Help output tests (additional) ───
+
+test "help: no version hides --version line" {
+    const Cmd = builder.cmd("run", "Run something");
+    const noop = struct {
+        fn f(_: Cmd.Args, _: Cmd.Options) !void {}
+    }.f;
+
+    var app = App(.{Cmd.bind(noop)}).init(std.testing.allocator, "myapp");
+    // Don't call setVersion
+
+    const help = try app.helpString(std.testing.allocator);
+    defer std.testing.allocator.free(help);
+
+    // Should not contain --version
+    try std.testing.expect(std.mem.indexOf(u8, help, "--version") == null);
+    // Should contain --help
+    try std.testing.expect(std.mem.indexOf(u8, help, "--help") != null);
+}
+
+test "help: three-level subcommand" {
+    const Add = builder.cmd("git remote add <name> <url>", "Add a git remote");
+    const Remove = builder.cmd("git remote remove <name>", "Remove a git remote");
+    const n1 = struct {
+        fn f(_: Add.Args, _: Add.Options) !void {}
+    }.f;
+    const n2 = struct {
+        fn f(_: Remove.Args, _: Remove.Options) !void {}
+    }.f;
+
+    var app = App(.{
+        Add.bind(n1),
+        Remove.bind(n2),
+    }).init(std.testing.allocator, "mygit");
+
+    const help = try app.helpString(std.testing.allocator);
+    defer std.testing.allocator.free(help);
+
+    try std.testing.expectEqualStrings(
+        \\mygit
+        \\
+        \\
+        \\Usage:
+        \\  $ mygit <command> [options]
+        \\
+        \\
+        \\Commands:
+        \\  git remote add <name> <url>  Add a git remote
+        \\
+        \\  git remote remove <name>     Remove a git remote
+        \\
+        \\
+        \\Options:
+        \\  -h, --help                   Display this message
+        \\
+    , help);
+}
+
+test "help: only default command shows cli name and [options]" {
+    const Root = builder.cmd("", "Do the thing")
+        .option("--force", "Force it");
+    const noop = struct {
+        fn f(_: Root.Args, _: Root.Options) !void {}
+    }.f;
+
+    var app = App(.{Root.bind(noop)}).init(std.testing.allocator, "doit");
+    app.setVersion("3.0.0");
+
+    const help = try app.helpString(std.testing.allocator);
+    defer std.testing.allocator.free(help);
+
+    try std.testing.expectEqualStrings(
+        \\doit/3.0.0
+        \\
+        \\
+        \\Usage:
+        \\  $ doit [options]
+        \\
+        \\
+        \\Commands:
+        \\  doit           Do the thing
+        \\    --force      Force it
+        \\
+        \\
+        \\Options:
+        \\  -h, --help     Display this message
+        \\  -v, --version  Display version number
+        \\
+    , help);
 }
