@@ -31,29 +31,12 @@ fn bold(comptime s: []const u8) []const u8 {
     return "\x1b[1m" ++ s ++ "\x1b[0m";
 }
 
-fn cyan(comptime s: []const u8) []const u8 {
-    return "\x1b[36m" ++ s ++ "\x1b[0m";
-}
-
 fn boldCyan(comptime s: []const u8) []const u8 {
     return "\x1b[1;36m" ++ s ++ "\x1b[0m";
 }
 
-fn blue(comptime s: []const u8) []const u8 {
-    return "\x1b[34m" ++ s ++ "\x1b[0m";
-}
-
 fn boldBlue(comptime s: []const u8) []const u8 {
     return "\x1b[1;34m" ++ s ++ "\x1b[0m";
-}
-
-fn dim(s: []const u8) ![]const u8 {
-    _ = s;
-    return "";
-}
-
-fn red(comptime s: []const u8) []const u8 {
-    return "\x1b[31m" ++ s ++ "\x1b[0m";
 }
 
 fn boldRed(comptime s: []const u8) []const u8 {
@@ -62,13 +45,10 @@ fn boldRed(comptime s: []const u8) []const u8 {
 
 // ─── Runtime option matching ───
 
-/// Match a single argv token against an option spec.
-/// Returns the field name if matched, null otherwise.
 fn matchOptionToken(
     comptime opt_specs: []const OptionSpec,
     token: []const u8,
 ) ?struct { index: usize, is_short: bool } {
-    // Check --long-name
     if (token.len > 2 and token[0] == '-' and token[1] == '-') {
         const flag_name = token[2..];
         inline for (opt_specs, 0..) |spec, i| {
@@ -78,7 +58,6 @@ fn matchOptionToken(
         }
         return null;
     }
-    // Check -x (short alias)
     if (token.len == 2 and token[0] == '-' and token[1] != '-') {
         const short_char = token[1];
         inline for (opt_specs, 0..) |spec, i| {
@@ -91,9 +70,6 @@ fn matchOptionToken(
     return null;
 }
 
-/// Set a single option field by runtime index. Uses inline for + comptime index
-/// comparison so each branch sees the correct field type.
-/// Returns number of tokens consumed (1 for flag, 2 for value, 0 for error).
 fn setOptionField(
     comptime OptsType: type,
     comptime opt_specs: []const OptionSpec,
@@ -114,29 +90,31 @@ fn setOptionField(
                         @field(opts, spec.field_name) = tokens[token_pos + 1];
                         return 2;
                     }
-                    return 0; // Missing required value
+                    return 0;
                 },
                 .optional => {
                     if (token_pos + 1 < tokens.len and (tokens[token_pos + 1].len == 0 or tokens[token_pos + 1][0] != '-')) {
                         @field(opts, spec.field_name) = tokens[token_pos + 1];
                         return 2;
                     }
-                    return 1; // Optional with no value — stays null
+                    return 1;
                 },
             }
         }
     }
-    return 1; // unreachable if index is valid
+    return 1;
 }
 
-/// Parse argv tokens into an Options struct for a given command.
-/// Returns the populated options struct and the remaining positional args.
+const ParseError = struct {
+    kind: enum { missing_value, unknown_option },
+    token: []const u8,
+};
+
 fn parseOptions(
     comptime OptsType: type,
     comptime opt_specs: []const OptionSpec,
     tokens: []const []const u8,
-) struct { opts: OptsType, positional: []const []const u8, double_dash: []const []const u8, err: ?[]const u8 } {
-    // Initialize opts with defaults: flags→false, optionals→null, required→undefined
+) struct { opts: OptsType, positional: []const []const u8, double_dash: []const []const u8, err: ?ParseError } {
     var opts: OptsType = undefined;
     inline for (opt_specs) |spec| {
         switch (spec.kind) {
@@ -158,7 +136,6 @@ fn parseOptions(
     while (i < tokens.len) {
         const token = tokens[i];
 
-        // Check for -- separator
         if (std.mem.eql(u8, token, "--")) {
             double_dash_start = i + 1;
             break;
@@ -168,23 +145,22 @@ fn parseOptions(
             if (matchOptionToken(opt_specs, token)) |match| {
                 const consumed = setOptionField(OptsType, opt_specs, &opts, match.index, tokens, i);
                 if (consumed == 0) {
-                    return .{ .opts = opts, .positional = &.{}, .double_dash = &.{}, .err = opt_specs[match.index].long_name };
+                    return .{ .opts = opts, .positional = &.{}, .double_dash = &.{}, .err = .{ .kind = .missing_value, .token = token } };
                 }
                 i += consumed;
                 continue;
             }
         }
-        if (token.len > 0 and token[0] == '-') {
-            // Unknown option — skip for now
-            i += 1;
-        } else {
-            // Positional arg
-            if (pos_count < positional_buf.len) {
-                positional_buf[pos_count] = token;
-                pos_count += 1;
-            }
-            i += 1;
+        // Unknown option → error
+        if (token.len > 1 and token[0] == '-') {
+            return .{ .opts = opts, .positional = &.{}, .double_dash = &.{}, .err = .{ .kind = .unknown_option, .token = token } };
         }
+        // Positional arg
+        if (pos_count < positional_buf.len) {
+            positional_buf[pos_count] = token;
+            pos_count += 1;
+        }
+        i += 1;
     }
 
     const double_dash = if (double_dash_start) |start| tokens[start..] else &[_][]const u8{};
@@ -197,7 +173,6 @@ fn parseOptions(
     };
 }
 
-/// Fill an Args struct from positional tokens.
 fn fillArgs(
     comptime ArgsType: type,
     comptime arg_specs: []const ArgSpec,
@@ -205,7 +180,6 @@ fn fillArgs(
 ) ?ArgsType {
     var args: ArgsType = undefined;
 
-    // Initialize optional fields to their defaults
     inline for (arg_specs) |spec| {
         if (!spec.required and !spec.variadic) {
             @field(args, spec.name) = null;
@@ -218,29 +192,62 @@ fn fillArgs(
     var pos_idx: usize = 0;
     inline for (arg_specs) |spec| {
         if (spec.variadic) {
-            // Consume all remaining positional args
             @field(args, spec.name) = if (pos_idx < positional.len) positional[pos_idx..] else &[_][]const u8{};
         } else if (pos_idx < positional.len) {
             @field(args, spec.name) = positional[pos_idx];
             pos_idx += 1;
         } else if (spec.required) {
-            return null; // Missing required arg
+            return null;
         }
     }
 
     return args;
 }
 
+// ─── Help formatting helpers ───
+
+/// Write `count` spaces to writer.
+fn writeSpaces(w: StdWriter, count: usize) void {
+    var n: usize = 0;
+    while (n < count) : (n += 1) {
+        w.writeByte(' ') catch {};
+    }
+}
+
+/// Compute the single shared alignment column across all commands and their
+/// options. This matches goke's behavior: one column for ALL descriptions.
+fn computeAlignColumn(comptime commands: anytype) usize {
+    comptime {
+        var max: usize = 0;
+        for (commands) |Cmd| {
+            // "  " + command raw name
+            const cmd_width = 2 + Cmd.command_raw_name.len;
+            if (cmd_width > max) max = cmd_width;
+
+            // "    " + option raw string
+            for (Cmd.command_opt_specs) |opt| {
+                const opt_width = 4 + opt.raw.len;
+                if (opt_width > max) max = opt_width;
+            }
+        }
+        // Also account for global options
+        const help_width = 2 + "-h, --help".len;
+        if (help_width > max) max = help_width;
+        const version_width = 2 + "-v, --version".len;
+        if (version_width > max) max = version_width;
+
+        // Add 2 for the gap between name column and description column
+        return max + 2;
+    }
+}
+
 // ─── App type factory ───
 
-/// Create a CLI application type from a tuple of bound commands.
-///
-///   var app = App(.{ ServeCmd, BuildCmd }).init(allocator, "myapp");
-///   try app.run();
 pub fn App(comptime commands: anytype) type {
+    const align_col = computeAlignColumn(commands);
+
     return struct {
         const Self = @This();
-        const Commands = commands;
 
         allocator: std.mem.Allocator,
         name: []const u8,
@@ -260,17 +267,14 @@ pub fn App(comptime commands: anytype) type {
             self.version = ver;
         }
 
-        /// Parse process argv and dispatch to the matched command.
         pub fn run(self: *Self) !void {
             var arg_iter = try std.process.argsWithAllocator(self.allocator);
             defer arg_iter.deinit();
 
-            // Collect args into a slice
             var argv_buf: [256][]const u8 = undefined;
             var argc: usize = 0;
 
-            // Skip argv[0] (program name)
-            _ = arg_iter.next();
+            _ = arg_iter.next(); // skip argv[0]
 
             while (arg_iter.next()) |arg| {
                 if (argc < argv_buf.len) {
@@ -279,30 +283,19 @@ pub fn App(comptime commands: anytype) type {
                 }
             }
 
-            const argv = argv_buf[0..argc];
-            try self.dispatch(argv);
+            try self.dispatch(argv_buf[0..argc]);
         }
 
-        /// Dispatch with an explicit argv slice (useful for testing).
         pub fn dispatch(self: *Self, argv: []const []const u8) !void {
-            // Check for --help
+            // Check for --help / -h
             for (argv) |arg| {
                 if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-                    // Check if there's a command prefix match for scoped help
-                    if (argv.len > 0 and !std.mem.startsWith(u8, argv[0], "-")) {
-                        if (self.findCommandHelp(argv)) |help_text| {
-                            const stdout = getStdout();
-                            try stdout.writeAll(help_text);
-                            try stdout.writeByte('\n');
-                            return;
-                        }
-                    }
                     self.outputHelp();
                     return;
                 }
             }
 
-            // Check for --version
+            // Check for --version / -v
             if (self.version != null) {
                 for (argv) |arg| {
                     if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
@@ -312,13 +305,15 @@ pub fn App(comptime commands: anytype) type {
                 }
             }
 
-            // Try matching each command (longest match first — inline for
-            // iterates the tuple which we order by name_parts length desc)
+            // Find longest matching command name
             var best_match_len: usize = 0;
             var matched = false;
+            var has_default_command = false;
 
-            // First pass: find the longest matching command
             inline for (commands) |Cmd| {
+                if (Cmd.command_name_parts.len == 0) {
+                    has_default_command = true;
+                }
                 const name_parts = Cmd.command_name_parts;
                 if (name_parts.len > best_match_len and name_parts.len <= argv.len) {
                     var all_match = true;
@@ -333,72 +328,76 @@ pub fn App(comptime commands: anytype) type {
                 }
             }
 
-            // Second pass: dispatch the command with the longest match
-            inline for (commands) |Cmd| {
-                const name_parts = Cmd.command_name_parts;
-                if (name_parts.len == best_match_len and !matched) {
-                    var all_match = true;
-                    inline for (name_parts, 0..) |part, pi| {
-                        if (pi >= argv.len or !std.mem.eql(u8, argv[pi], part)) {
-                            all_match = false;
+            // Dispatch the command with the longest match
+            if (best_match_len > 0) {
+                inline for (commands) |Cmd| {
+                    const name_parts = Cmd.command_name_parts;
+                    if (name_parts.len == best_match_len and !matched) {
+                        var all_match = true;
+                        inline for (name_parts, 0..) |part, pi| {
+                            if (pi >= argv.len or !std.mem.eql(u8, argv[pi], part)) {
+                                all_match = false;
+                            }
+                        }
+                        if (all_match) {
+                            matched = true;
+                            const remaining = argv[name_parts.len..];
+                            try dispatchCommand(Cmd, remaining);
+                            return;
                         }
                     }
-                    if (all_match) {
+                }
+            }
+
+            // No named command matched — try default command (empty name)
+            if (!matched) {
+                inline for (commands) |Cmd| {
+                    if (Cmd.command_name_parts.len == 0 and !matched) {
                         matched = true;
-                        const remaining = argv[name_parts.len..];
-                        const parsed = parseOptions(Cmd.Options, Cmd.command_opt_specs, remaining);
-
-                        if (parsed.err) |opt_name| {
-                            const stderr = getStderr();
-                            try stderr.print(boldRed("error:") ++ " option --{s} requires a value\n", .{opt_name});
-                            return error.MissingOptionValue;
-                        }
-
-                        const args = fillArgs(Cmd.Args, Cmd.command_arg_specs, parsed.positional);
-                        if (args == null) {
-                            const stderr = getStderr();
-                            try stderr.print(boldRed("error:") ++ " missing required arguments for `{s}`\n", .{Cmd.command_raw_name});
-                            return error.MissingRequiredArg;
-                        }
-
-                        try Cmd.invoke(args.?, parsed.opts);
+                        try dispatchCommand(Cmd, argv);
                         return;
                     }
                 }
             }
 
-            // No match — check for default command (empty name)
-            inline for (commands) |Cmd| {
-                if (Cmd.command_name_parts.len == 0 and !matched) {
-                    matched = true;
-                    const parsed = parseOptions(Cmd.Options, Cmd.command_opt_specs, argv);
-                    if (parsed.err) |opt_name| {
-                        const stderr = getStderr();
-                        try stderr.print(boldRed("error:") ++ " option --{s} requires a value\n", .{opt_name});
-                        return error.MissingOptionValue;
+            // Nothing matched
+            if (!matched) {
+                if (argv.len == 0 or has_default_command) {
+                    self.outputHelp();
+                } else {
+                    const stderr = getStderr();
+                    stderr.print(boldRed("error:") ++ " unknown command `{s}`\n", .{argv[0]}) catch {};
+                    if (self.help_enabled) {
+                        stderr.print("Run \"{s} --help\" for usage information.\n", .{self.name}) catch {};
                     }
-                    const args = fillArgs(Cmd.Args, Cmd.command_arg_specs, parsed.positional);
-                    if (args == null) {
-                        const stderr = getStderr();
-                        try stderr.print(boldRed("error:") ++ " missing required arguments for `{s}`\n", .{Cmd.command_raw_name});
-                        return error.MissingRequiredArg;
-                    }
-                    try Cmd.invoke(args.?, parsed.opts);
-                    return;
                 }
-            }
-
-            // Nothing matched — show help
-            if (self.help_enabled) {
-                self.outputHelp();
             }
         }
 
-        fn findCommandHelp(self: *Self, argv: []const []const u8) ?[]const u8 {
-            _ = self;
-            _ = argv;
-            // TODO: scoped help for subcommand groups
-            return null;
+        fn dispatchCommand(comptime Cmd: type, remaining: []const []const u8) !void {
+            const parsed = parseOptions(Cmd.Options, Cmd.command_opt_specs, remaining);
+
+            if (parsed.err) |parse_err| {
+                const stderr = getStderr();
+                switch (parse_err.kind) {
+                    .missing_value => {
+                        try stderr.print(boldRed("error:") ++ " option `{s}` value is missing\n", .{parse_err.token});
+                    },
+                    .unknown_option => {
+                        try stderr.print(boldRed("error:") ++ " Unknown option `{s}`\n", .{parse_err.token});
+                    },
+                }
+                return error.ParseError;
+            }
+
+            const args = fillArgs(Cmd.Args, Cmd.command_arg_specs, parsed.positional);
+            if (args == null) {
+                const stderr = getStderr();
+                try stderr.print(boldRed("error:") ++ " missing required arguments for `{s}`\n", .{Cmd.command_raw_name});
+                return error.MissingRequiredArg;
+            }
+
+            try Cmd.invoke(args.?, parsed.opts);
         }
 
         pub fn outputVersion(self: *Self) void {
@@ -409,63 +408,83 @@ pub fn App(comptime commands: anytype) type {
         }
 
         pub fn outputHelp(self: *Self) void {
-            const stdout = getStdout();
+            const w = getStdout();
 
             // Header
             if (self.version) |ver| {
-                stdout.print(bold("{s}") ++ "/{s}\n\n", .{ self.name, ver }) catch {};
+                w.print(bold("{s}") ++ "/{s}\n", .{ self.name, ver }) catch {};
             } else {
-                stdout.print(bold("{s}") ++ "\n\n", .{self.name}) catch {};
+                w.print(bold("{s}") ++ "\n", .{self.name}) catch {};
             }
 
-            // Usage
-            stdout.print(boldBlue("Usage") ++ ":\n  $ {s} <command> [options]\n\n", .{self.name}) catch {};
-
-            // Commands
-            stdout.print(boldBlue("Commands") ++ ":\n", .{}) catch {};
-
-            // Calculate padding
-            var max_name_len: usize = 0;
+            // Usage line — adapt based on whether there's a default command
+            var has_default = false;
             inline for (commands) |Cmd| {
-                const name_len = Cmd.command_raw_name.len;
-                if (name_len > max_name_len) max_name_len = name_len;
-            }
-
-            inline for (commands) |Cmd| {
-                const raw = Cmd.command_raw_name;
-                const desc = Cmd.command_description;
-                const padding = max_name_len - raw.len + 2;
-                stdout.print("  " ++ boldCyan("{s}"), .{raw}) catch {};
-                var p: usize = 0;
-                while (p < padding) : (p += 1) {
-                    stdout.writeByte(' ') catch {};
+                if (Cmd.command_name_parts.len == 0) {
+                    has_default = true;
                 }
-                stdout.print("{s}\n", .{desc}) catch {};
+            }
 
-                // Print command-specific options indented
+            w.print("\n\n" ++ boldBlue("Usage") ++ ":\n", .{}) catch {};
+            if (has_default) {
+                w.print("  $ {s} [options]\n", .{self.name}) catch {};
+            } else {
+                w.print("  $ {s} <command> [options]\n", .{self.name}) catch {};
+            }
+
+            // Commands section
+            w.print("\n\n" ++ boldBlue("Commands") ++ ":\n", .{}) catch {};
+
+            inline for (commands) |Cmd| {
+                const raw_name = Cmd.command_raw_name;
+                // Default command shows as the CLI name
+                const display_name = if (raw_name.len == 0) self.name else raw_name;
+                const display_prefix: usize = if (raw_name.len == 0) 0 else 0;
+                _ = display_prefix;
+
+                // Command line: "  <name>  <padded description>"
+                w.print("  ", .{}) catch {};
+                w.print(boldCyan("{s}"), .{display_name}) catch {};
+                const used = 2 + display_name.len;
+                if (used < align_col) {
+                    writeSpaces(w, align_col - used);
+                } else {
+                    writeSpaces(w, 2);
+                }
+                w.print("{s}\n", .{Cmd.command_description}) catch {};
+
+                // Command options, indented with same alignment column
                 inline for (Cmd.command_opt_specs) |opt| {
-                    stdout.print("    {s}", .{opt.raw}) catch {};
+                    w.print("    {s}", .{opt.raw}) catch {};
+                    const opt_used = 4 + opt.raw.len;
                     if (opt.description.len > 0) {
-                        // Pad to align descriptions
-                        const opt_padding = if (opt.raw.len < max_name_len - 2)
-                            max_name_len - 2 - opt.raw.len
-                        else
-                            2;
-                        var op: usize = 0;
-                        while (op < opt_padding) : (op += 1) {
-                            stdout.writeByte(' ') catch {};
+                        if (opt_used < align_col) {
+                            writeSpaces(w, align_col - opt_used);
+                        } else {
+                            writeSpaces(w, 2);
                         }
-                        stdout.print("{s}", .{opt.description}) catch {};
+                        w.print("{s}", .{opt.description}) catch {};
                     }
-                    stdout.writeByte('\n') catch {};
+                    w.writeByte('\n') catch {};
                 }
+
+                // Blank line between command blocks
+                w.writeByte('\n') catch {};
             }
 
-            // Global options
-            stdout.print("\n" ++ boldBlue("Options") ++ ":\n", .{}) catch {};
-            stdout.print("  -h, --help     Display this message\n", .{}) catch {};
+            // Global options section
+            w.print("\n" ++ boldBlue("Options") ++ ":\n", .{}) catch {};
+
+            w.print("  -h, --help", .{}) catch {};
+            const help_used = 2 + "-h, --help".len;
+            writeSpaces(w, align_col - help_used);
+            w.print("Display this message\n", .{}) catch {};
+
             if (self.version != null) {
-                stdout.print("  -v, --version  Display version number\n", .{}) catch {};
+                w.print("  -v, --version", .{}) catch {};
+                const ver_used = 2 + "-v, --version".len;
+                writeSpaces(w, align_col - ver_used);
+                w.print("Display version number\n", .{}) catch {};
             }
         }
     };
@@ -514,6 +533,19 @@ test "parseOptions: double dash separator" {
     try std.testing.expectEqualStrings("--extra", result.double_dash[0]);
 }
 
+test "parseOptions: unknown option returns error" {
+    const specs = [_]OptionSpec{
+        .{ .field_name = "watch", .long_name = "watch", .short = 0, .kind = .flag, .description = "", .raw = "" },
+    };
+    const OptsType = builder.buildOptionsType(&specs);
+    const argv = [_][]const u8{ "--watch", "--unknown" };
+    const result = parseOptions(OptsType, &specs, &argv);
+
+    try std.testing.expect(result.err != null);
+    try std.testing.expectEqual(.unknown_option, result.err.?.kind);
+    try std.testing.expectEqualStrings("--unknown", result.err.?.token);
+}
+
 test "fillArgs: required and optional" {
     const specs = [_]ArgSpec{
         .{ .name = "key", .required = true, .variadic = false },
@@ -521,21 +553,18 @@ test "fillArgs: required and optional" {
     };
     const ArgsType = builder.buildArgsType(&specs);
 
-    // Both provided
     const positional = [_][]const u8{ "mykey", "myval" };
     const args = fillArgs(ArgsType, &specs, &positional);
     try std.testing.expect(args != null);
     try std.testing.expectEqualStrings("mykey", args.?.key);
     try std.testing.expectEqualStrings("myval", args.?.value.?);
 
-    // Only required
     const positional2 = [_][]const u8{"mykey"};
     const args2 = fillArgs(ArgsType, &specs, &positional2);
     try std.testing.expect(args2 != null);
     try std.testing.expectEqualStrings("mykey", args2.?.key);
     try std.testing.expectEqual(@as(?[]const u8, null), args2.?.value);
 
-    // Missing required
     const positional3 = [_][]const u8{};
     const args3 = fillArgs(ArgsType, &specs, &positional3);
     try std.testing.expect(args3 == null);
