@@ -206,8 +206,7 @@ fn fillArgs(
 
 // ─── Help formatting helpers ───
 
-/// Write `count` spaces to writer.
-fn writeSpaces(w: StdWriter, count: usize) void {
+fn writeSpacesAny(w: anytype, count: usize) void {
     var n: usize = 0;
     while (n < count) : (n += 1) {
         w.writeByte(' ') catch {};
@@ -409,15 +408,31 @@ pub fn App(comptime commands: anytype) type {
 
         pub fn outputHelp(self: *Self) void {
             const w = getStdout();
+            self.writeHelp(w, true);
+        }
+
+        /// Write help text to a buffer (for testing). No ANSI codes.
+        pub fn helpString(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
+            var managed = std.array_list.AlignedManaged(u8, null).init(allocator);
+            errdefer managed.deinit();
+            self.writeHelp(managed.writer(), false);
+            return managed.toOwnedSlice();
+        }
+
+        fn writeHelp(self: *Self, w: anytype, comptime ansi: bool) void {
+            const b = if (ansi) "\x1b[1m" else "";
+            const bc = if (ansi) "\x1b[1;36m" else "";
+            const bb = if (ansi) "\x1b[1;34m" else "";
+            const r = if (ansi) "\x1b[0m" else "";
 
             // Header
             if (self.version) |ver| {
-                w.print(bold("{s}") ++ "/{s}\n", .{ self.name, ver }) catch {};
+                w.print("{s}{s}{s}/{s}\n", .{ b, self.name, r, ver }) catch {};
             } else {
-                w.print(bold("{s}") ++ "\n", .{self.name}) catch {};
+                w.print("{s}{s}{s}\n", .{ b, self.name, r }) catch {};
             }
 
-            // Usage line — adapt based on whether there's a default command
+            // Usage
             var has_default = false;
             inline for (commands) |Cmd| {
                 if (Cmd.command_name_parts.len == 0) {
@@ -425,65 +440,56 @@ pub fn App(comptime commands: anytype) type {
                 }
             }
 
-            w.print("\n\n" ++ boldBlue("Usage") ++ ":\n", .{}) catch {};
+            w.print("\n\n{s}Usage{s}:\n", .{ bb, r }) catch {};
             if (has_default) {
                 w.print("  $ {s} [options]\n", .{self.name}) catch {};
             } else {
                 w.print("  $ {s} <command> [options]\n", .{self.name}) catch {};
             }
 
-            // Commands section
-            w.print("\n\n" ++ boldBlue("Commands") ++ ":\n", .{}) catch {};
+            // Commands
+            w.print("\n\n{s}Commands{s}:\n", .{ bb, r }) catch {};
 
             inline for (commands) |Cmd| {
                 const raw_name = Cmd.command_raw_name;
-                // Default command shows as the CLI name
                 const display_name = if (raw_name.len == 0) self.name else raw_name;
-                const display_prefix: usize = if (raw_name.len == 0) 0 else 0;
-                _ = display_prefix;
 
-                // Command line: "  <name>  <padded description>"
-                w.print("  ", .{}) catch {};
-                w.print(boldCyan("{s}"), .{display_name}) catch {};
+                w.print("  {s}{s}{s}", .{ bc, display_name, r }) catch {};
                 const used = 2 + display_name.len;
                 if (used < align_col) {
-                    writeSpaces(w, align_col - used);
+                    writeSpacesAny(w, align_col - used);
                 } else {
-                    writeSpaces(w, 2);
+                    writeSpacesAny(w, 2);
                 }
                 w.print("{s}\n", .{Cmd.command_description}) catch {};
 
-                // Command options, indented with same alignment column
                 inline for (Cmd.command_opt_specs) |opt| {
                     w.print("    {s}", .{opt.raw}) catch {};
                     const opt_used = 4 + opt.raw.len;
                     if (opt.description.len > 0) {
                         if (opt_used < align_col) {
-                            writeSpaces(w, align_col - opt_used);
+                            writeSpacesAny(w, align_col - opt_used);
                         } else {
-                            writeSpaces(w, 2);
+                            writeSpacesAny(w, 2);
                         }
                         w.print("{s}", .{opt.description}) catch {};
                     }
                     w.writeByte('\n') catch {};
                 }
 
-                // Blank line between command blocks
                 w.writeByte('\n') catch {};
             }
 
-            // Global options section
-            w.print("\n" ++ boldBlue("Options") ++ ":\n", .{}) catch {};
+            // Global options
+            w.print("\n{s}Options{s}:\n", .{ bb, r }) catch {};
 
             w.print("  -h, --help", .{}) catch {};
-            const help_used = 2 + "-h, --help".len;
-            writeSpaces(w, align_col - help_used);
+            writeSpacesAny(w, align_col - (2 + "-h, --help".len));
             w.print("Display this message\n", .{}) catch {};
 
             if (self.version != null) {
                 w.print("  -v, --version", .{}) catch {};
-                const ver_used = 2 + "-v, --version".len;
-                writeSpaces(w, align_col - ver_used);
+                writeSpacesAny(w, align_col - (2 + "-v, --version".len));
                 w.print("Display version number\n", .{}) catch {};
             }
         }
@@ -545,6 +551,282 @@ test "parseOptions: unknown option returns error" {
     try std.testing.expectEqual(.unknown_option, result.err.?.kind);
     try std.testing.expectEqualStrings("--unknown", result.err.?.token);
 }
+
+// ─── Help output tests ───
+
+test "help: simple CLI with two commands" {
+    const Serve = builder.cmd("serve", "Start the dev server")
+        .option("--port <port>", "Port number")
+        .option("--host [host]", "Hostname");
+    const Build = builder.cmd("build [entry]", "Build the project")
+        .option("--watch", "Watch mode")
+        .option("--outdir <dir>", "Output directory");
+
+    const noop1 = struct {
+        fn f(_: Serve.Args, _: Serve.Options) !void {}
+    }.f;
+    const noop2 = struct {
+        fn f(_: Build.Args, _: Build.Options) !void {}
+    }.f;
+
+    var app = App(.{
+        Serve.bind(noop1),
+        Build.bind(noop2),
+    }).init(std.testing.allocator, "myapp");
+    app.setVersion("1.0.0");
+
+    const help = try app.helpString(std.testing.allocator);
+    defer std.testing.allocator.free(help);
+
+    try std.testing.expectEqualStrings(
+        \\myapp/1.0.0
+        \\
+        \\
+        \\Usage:
+        \\  $ myapp <command> [options]
+        \\
+        \\
+        \\Commands:
+        \\  serve             Start the dev server
+        \\    --port <port>   Port number
+        \\    --host [host]   Hostname
+        \\
+        \\  build [entry]     Build the project
+        \\    --watch         Watch mode
+        \\    --outdir <dir>  Output directory
+        \\
+        \\
+        \\Options:
+        \\  -h, --help        Display this message
+        \\  -v, --version     Display version number
+        \\
+    , help);
+}
+
+test "help: space-separated subcommands align correctly" {
+    const Login = builder.cmd("auth login", "Authenticate with provider");
+    const Logout = builder.cmd("auth logout", "Clear credentials")
+        .option("--force", "Skip confirmation");
+    const List = builder.cmd("mail list", "List email threads")
+        .option("--folder [folder]", "Folder to list");
+
+    const n1 = struct {
+        fn f(_: Login.Args, _: Login.Options) !void {}
+    }.f;
+    const n2 = struct {
+        fn f(_: Logout.Args, _: Logout.Options) !void {}
+    }.f;
+    const n3 = struct {
+        fn f(_: List.Args, _: List.Options) !void {}
+    }.f;
+
+    var app = App(.{
+        Login.bind(n1),
+        Logout.bind(n2),
+        List.bind(n3),
+    }).init(std.testing.allocator, "gtui");
+
+    const help = try app.helpString(std.testing.allocator);
+    defer std.testing.allocator.free(help);
+
+    try std.testing.expectEqualStrings(
+        \\gtui
+        \\
+        \\
+        \\Usage:
+        \\  $ gtui <command> [options]
+        \\
+        \\
+        \\Commands:
+        \\  auth login           Authenticate with provider
+        \\
+        \\  auth logout          Clear credentials
+        \\    --force            Skip confirmation
+        \\
+        \\  mail list            List email threads
+        \\    --folder [folder]  Folder to list
+        \\
+        \\
+        \\Options:
+        \\  -h, --help           Display this message
+        \\
+    , help);
+}
+
+test "help: default command with subcommands" {
+    const Root = builder.cmd("", "Deploy the current project")
+        .option("--env <env>", "Target environment")
+        .option("--dry-run", "Preview without deploying");
+    const Init = builder.cmd("init", "Initialize project");
+    const Status = builder.cmd("status", "Show deployment status");
+
+    const n1 = struct {
+        fn f(_: Root.Args, _: Root.Options) !void {}
+    }.f;
+    const n2 = struct {
+        fn f(_: Init.Args, _: Init.Options) !void {}
+    }.f;
+    const n3 = struct {
+        fn f(_: Status.Args, _: Status.Options) !void {}
+    }.f;
+
+    var app = App(.{
+        Root.bind(n1),
+        Init.bind(n2),
+        Status.bind(n3),
+    }).init(std.testing.allocator, "deploy");
+    app.setVersion("2.0.0");
+
+    const help = try app.helpString(std.testing.allocator);
+    defer std.testing.allocator.free(help);
+
+    try std.testing.expectEqualStrings(
+        \\deploy/2.0.0
+        \\
+        \\
+        \\Usage:
+        \\  $ deploy [options]
+        \\
+        \\
+        \\Commands:
+        \\  deploy         Deploy the current project
+        \\    --env <env>  Target environment
+        \\    --dry-run    Preview without deploying
+        \\
+        \\  init           Initialize project
+        \\
+        \\  status         Show deployment status
+        \\
+        \\
+        \\Options:
+        \\  -h, --help     Display this message
+        \\  -v, --version  Display version number
+        \\
+    , help);
+}
+
+test "help: single command no options" {
+    const Ping = builder.cmd("ping <host>", "Ping a host");
+
+    const noop = struct {
+        fn f(_: Ping.Args, _: Ping.Options) !void {}
+    }.f;
+
+    var app = App(.{
+        Ping.bind(noop),
+    }).init(std.testing.allocator, "netool");
+
+    const help = try app.helpString(std.testing.allocator);
+    defer std.testing.allocator.free(help);
+
+    try std.testing.expectEqualStrings(
+        \\netool
+        \\
+        \\
+        \\Usage:
+        \\  $ netool <command> [options]
+        \\
+        \\
+        \\Commands:
+        \\  ping <host>    Ping a host
+        \\
+        \\
+        \\Options:
+        \\  -h, --help     Display this message
+        \\
+    , help);
+}
+
+test "help: many commands with long option names push alignment column" {
+    const Screenshot = builder.cmd("screenshot [path]", "Take a screenshot")
+        .option("--region [region]", "Capture specific region")
+        .option("--json", "Output as JSON");
+    const Click = builder.cmd("click", "Click at coordinates")
+        .option("-x <x>", "X coordinate")
+        .option("-y <y>", "Y coordinate")
+        .option("--coord-map [map]", "Coordinate mapping: x1,y1,x2,y2,w,h");
+
+    const n1 = struct {
+        fn f(_: Screenshot.Args, _: Screenshot.Options) !void {}
+    }.f;
+    const n2 = struct {
+        fn f(_: Click.Args, _: Click.Options) !void {}
+    }.f;
+
+    var app = App(.{
+        Screenshot.bind(n1),
+        Click.bind(n2),
+    }).init(std.testing.allocator, "uc");
+
+    const help = try app.helpString(std.testing.allocator);
+    defer std.testing.allocator.free(help);
+
+    // --coord-map [map] (4 + 17 = 21) is wider than screenshot [path] (2 + 17 = 19)
+    // so alignment column is driven by the option, not the command name
+    try std.testing.expectEqualStrings(
+        \\uc
+        \\
+        \\
+        \\Usage:
+        \\  $ uc <command> [options]
+        \\
+        \\
+        \\Commands:
+        \\  screenshot [path]    Take a screenshot
+        \\    --region [region]  Capture specific region
+        \\    --json             Output as JSON
+        \\
+        \\  click                Click at coordinates
+        \\    -x <x>             X coordinate
+        \\    -y <y>             Y coordinate
+        \\    --coord-map [map]  Coordinate mapping: x1,y1,x2,y2,w,h
+        \\
+        \\
+        \\Options:
+        \\  -h, --help           Display this message
+        \\
+    , help);
+}
+
+test "help: short aliases displayed in options" {
+    const Cmd = builder.cmd("serve", "Start server")
+        .option("-p, --port <port>", "Port number")
+        .option("-H, --host [host]", "Hostname")
+        .option("--verbose", "Verbose output");
+
+    const noop = struct {
+        fn f(_: Cmd.Args, _: Cmd.Options) !void {}
+    }.f;
+
+    var app = App(.{
+        Cmd.bind(noop),
+    }).init(std.testing.allocator, "srv");
+
+    const help = try app.helpString(std.testing.allocator);
+    defer std.testing.allocator.free(help);
+
+    try std.testing.expectEqualStrings(
+        \\srv
+        \\
+        \\
+        \\Usage:
+        \\  $ srv <command> [options]
+        \\
+        \\
+        \\Commands:
+        \\  serve                Start server
+        \\    -p, --port <port>  Port number
+        \\    -H, --host [host]  Hostname
+        \\    --verbose          Verbose output
+        \\
+        \\
+        \\Options:
+        \\  -h, --help           Display this message
+        \\
+    , help);
+}
+
+// ─── Parsing tests ───
 
 test "fillArgs: required and optional" {
     const specs = [_]ArgSpec{
