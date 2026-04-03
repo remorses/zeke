@@ -39,7 +39,9 @@ const zeke = @import("zeke");
 const Serve = zeke.cmd("serve <entry>", "Start the dev server")
     .option("--port <port>", "Port number")
     .option("--host [host]", "Hostname")
-    .option("--watch", "Watch mode");
+    .option("--watch", "Watch mode")
+    .optionMany("--tag <tag>", "Repeatable tag")
+    .example("myapp serve src/index.ts --port 3000 --tag api --tag internal");
 ```
 
 **Write typed action functions** — the compiler checks every field access:
@@ -50,6 +52,7 @@ fn serveAction(args: Serve.Args, opts: Serve.Options) !void {
     // opts.port  → []const u8  (required value)
     // opts.host  → ?[]const u8 (optional, null if absent)
     // opts.watch → bool        (flag)
+    // opts.tag   → []const []const u8 (repeatable value option)
     // opts.bogus → COMPILE ERROR
     _ = .{ args, opts };
 }
@@ -90,8 +93,10 @@ first, write the action using its `.Args`/`.Options` types, then bind.
 - **Compile-time field checking** — wrong field access = compile error
 - **Space-separated subcommands** — `mouse move`, `clipboard get` with longest-match dispatch
 - **Short aliases** — `-p, --port <port>` or `-x [x]`
+- **Repeatable value options** — `.optionMany("--tag <tag>", ...)` collects `--tag` values into a slice
 - **Positional args** — `<required>`, `[optional]`, `[...variadic]`
 - **Auto help** — `--help` / `-h` with aligned columns and ANSI colors
+- **Command help** — `myapp serve --help` shows help for that command, including examples
 - **Auto version** — `--version` / `-v`
 - **Double-dash** — `--` separator for passthrough args
 - **Zero dependencies** — pure Zig, no allocations in the comptime layer
@@ -103,6 +108,7 @@ first, write the action using its `.Args`/`.Options` types, then bind.
 | `--port <port>` | `[]const u8` | none (required) |
 | `--host [host]` | `?[]const u8` | `null` |
 | `--watch` | `bool` | `false` |
+| `.optionMany("--tag <tag>", ...)` | `[]const []const u8` | empty slice |
 | `--coord-map [map]` | `?[]const u8` | `null` (kebab → snake_case) |
 | `-p, --port <port>` | `[]const u8` | none, short alias `p` |
 

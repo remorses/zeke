@@ -71,13 +71,14 @@ fn matchOptionToken(
 }
 
 fn setOptionField(
+    allocator: std.mem.Allocator,
     comptime OptsType: type,
     comptime opt_specs: []const OptionSpec,
     opts: *OptsType,
     match_index: usize,
     tokens: []const []const u8,
     token_pos: usize,
-) usize {
+) !usize {
     inline for (opt_specs, 0..) |spec, si| {
         if (si == match_index) {
             switch (spec.kind) {
@@ -86,14 +87,25 @@ fn setOptionField(
                     return 1;
                 },
                 .required => {
-                    if (token_pos + 1 < tokens.len and (tokens[token_pos + 1].len == 0 or tokens[token_pos + 1][0] != '-')) {
-                        @field(opts, spec.field_name) = tokens[token_pos + 1];
+                    if (token_pos + 1 < tokens.len) {
+                        if (spec.multi) {
+                            const current = @field(opts, spec.field_name);
+                            const next = try allocator.alloc([]const u8, current.len + 1);
+                            if (current.len > 0) {
+                                @memcpy(next[0..current.len], current);
+                                allocator.free(current);
+                            }
+                            next[current.len] = tokens[token_pos + 1];
+                            @field(opts, spec.field_name) = next;
+                        } else {
+                            @field(opts, spec.field_name) = tokens[token_pos + 1];
+                        }
                         return 2;
                     }
                     return 0;
                 },
                 .optional => {
-                    if (token_pos + 1 < tokens.len and (tokens[token_pos + 1].len == 0 or tokens[token_pos + 1][0] != '-')) {
+                    if (token_pos + 1 < tokens.len and !std.mem.eql(u8, tokens[token_pos + 1], "--") and matchOptionToken(opt_specs, tokens[token_pos + 1]) == null) {
                         @field(opts, spec.field_name) = tokens[token_pos + 1];
                         return 2;
                     }
@@ -111,10 +123,11 @@ const ParseError = struct {
 };
 
 fn parseOptions(
+    allocator: std.mem.Allocator,
     comptime OptsType: type,
     comptime opt_specs: []const OptionSpec,
     tokens: []const []const u8,
-) struct { opts: OptsType, positional: []const []const u8, double_dash: []const []const u8, err: ?ParseError } {
+) !struct { opts: OptsType, positional: []const []const u8, double_dash: []const []const u8, err: ?ParseError } {
     var opts: OptsType = undefined;
     inline for (opt_specs) |spec| {
         switch (spec.kind) {
@@ -125,6 +138,9 @@ fn parseOptions(
                 @field(opts, spec.field_name) = null;
             },
             .required => {},
+        }
+        if (spec.multi) {
+            @field(opts, spec.field_name) = &[_][]const u8{};
         }
     }
 
@@ -143,7 +159,7 @@ fn parseOptions(
 
         if (opt_specs.len > 0) {
             if (matchOptionToken(opt_specs, token)) |match| {
-                const consumed = setOptionField(OptsType, opt_specs, &opts, match.index, tokens, i);
+                const consumed = try setOptionField(allocator, OptsType, opt_specs, &opts, match.index, tokens, i);
                 if (consumed == 0) {
                     return .{ .opts = opts, .positional = &.{}, .double_dash = &.{}, .err = .{ .kind = .missing_value, .token = token } };
                 }
@@ -171,6 +187,23 @@ fn parseOptions(
         .double_dash = double_dash,
         .err = null,
     };
+}
+
+fn deinitOptions(
+    comptime OptsType: type,
+    comptime opt_specs: []const OptionSpec,
+    allocator: std.mem.Allocator,
+    opts: *OptsType,
+) void {
+    inline for (opt_specs) |spec| {
+        if (spec.multi) {
+            const values = @field(opts, spec.field_name);
+            if (values.len > 0) {
+                allocator.free(values);
+                @field(opts, spec.field_name) = &[_][]const u8{};
+            }
+        }
+    }
 }
 
 fn fillArgs(
@@ -240,6 +273,15 @@ fn computeAlignColumn(comptime commands: anytype) usize {
     }
 }
 
+fn containsFlag(argv: []const []const u8, long: []const u8, short: []const u8) bool {
+    for (argv) |arg| {
+        if (std.mem.eql(u8, arg, long) or std.mem.eql(u8, arg, short)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // ─── App type factory ───
 
 pub fn App(comptime commands: anytype) type {
@@ -286,22 +328,15 @@ pub fn App(comptime commands: anytype) type {
         }
 
         pub fn dispatch(self: *Self, argv: []const []const u8) !void {
-            // Check for --help / -h
-            for (argv) |arg| {
-                if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-                    self.outputHelp();
-                    return;
-                }
+            // Check for --version / -v
+            if (self.version != null and containsFlag(argv, "--version", "-v")) {
+                self.outputVersion();
+                return;
             }
 
-            // Check for --version / -v
-            if (self.version != null) {
-                for (argv) |arg| {
-                    if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
-                        self.outputVersion();
-                        return;
-                    }
-                }
+            if (containsFlag(argv, "--help", "-h") and (argv.len == 1 or std.mem.eql(u8, argv[0], "--help") or std.mem.eql(u8, argv[0], "-h"))) {
+                self.outputHelp();
+                return;
             }
 
             // Find longest matching command name
@@ -341,7 +376,11 @@ pub fn App(comptime commands: anytype) type {
                         if (all_match) {
                             matched = true;
                             const remaining = argv[name_parts.len..];
-                            try dispatchCommand(Cmd, remaining);
+                            if (containsFlag(remaining, "--help", "-h")) {
+                                self.outputCommandHelp(Cmd);
+                                return;
+                            }
+                            try self.dispatchCommand(Cmd, remaining);
                             return;
                         }
                     }
@@ -353,7 +392,11 @@ pub fn App(comptime commands: anytype) type {
                 inline for (commands) |Cmd| {
                     if (Cmd.command_name_parts.len == 0 and !matched) {
                         matched = true;
-                        try dispatchCommand(Cmd, argv);
+                        if (containsFlag(argv, "--help", "-h")) {
+                            self.outputCommandHelp(Cmd);
+                            return;
+                        }
+                        try self.dispatchCommand(Cmd, argv);
                         return;
                     }
                 }
@@ -373,8 +416,9 @@ pub fn App(comptime commands: anytype) type {
             }
         }
 
-        fn dispatchCommand(comptime Cmd: type, remaining: []const []const u8) !void {
-            const parsed = parseOptions(Cmd.Options, Cmd.command_opt_specs, remaining);
+        fn dispatchCommand(self: *Self, comptime Cmd: type, remaining: []const []const u8) !void {
+            var parsed = try parseOptions(self.allocator, Cmd.Options, Cmd.command_opt_specs, remaining);
+            defer deinitOptions(Cmd.Options, Cmd.command_opt_specs, self.allocator, &parsed.opts);
 
             if (parsed.err) |parse_err| {
                 const stderr = getStderr();
@@ -411,11 +455,23 @@ pub fn App(comptime commands: anytype) type {
             self.writeHelp(w, true);
         }
 
+        fn outputCommandHelp(self: *Self, comptime Cmd: type) void {
+            const w = getStdout();
+            self.writeCommandHelp(Cmd, w, true);
+        }
+
         /// Write help text to a buffer (for testing). No ANSI codes.
         pub fn helpString(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
             var managed = std.array_list.AlignedManaged(u8, null).init(allocator);
             errdefer managed.deinit();
             self.writeHelp(managed.writer(), false);
+            return managed.toOwnedSlice();
+        }
+
+        pub fn commandHelpString(self: *Self, comptime Cmd: type, allocator: std.mem.Allocator) ![]const u8 {
+            var managed = std.array_list.AlignedManaged(u8, null).init(allocator);
+            errdefer managed.deinit();
+            self.writeCommandHelp(Cmd, managed.writer(), false);
             return managed.toOwnedSlice();
         }
 
@@ -493,6 +549,66 @@ pub fn App(comptime commands: anytype) type {
                 w.print("Display version number\n", .{}) catch {};
             }
         }
+
+        fn writeCommandHelp(self: *Self, comptime Cmd: type, w: anytype, comptime ansi: bool) void {
+            const b = if (ansi) "\x1b[1m" else "";
+            const bc = if (ansi) "\x1b[1;36m" else "";
+            const bb = if (ansi) "\x1b[1;34m" else "";
+            const r = if (ansi) "\x1b[0m" else "";
+            var command_align_col: usize = 2 + "-h, --help".len;
+            if (self.version != null) {
+                command_align_col = @max(command_align_col, 2 + "-v, --version".len);
+            }
+            inline for (Cmd.command_opt_specs) |opt| {
+                command_align_col = @max(command_align_col, 2 + opt.raw.len);
+            }
+            command_align_col += 2;
+
+            if (self.version) |ver| {
+                w.print("{s}{s}{s}/{s}\n", .{ b, self.name, r, ver }) catch {};
+            } else {
+                w.print("{s}{s}{s}\n", .{ b, self.name, r }) catch {};
+            }
+
+            w.print("\n\n{s}Usage{s}:\n", .{ bb, r }) catch {};
+            if (Cmd.command_raw_name.len == 0) {
+                w.print("  $ {s} [options]\n", .{self.name}) catch {};
+            } else {
+                w.print("  $ {s} {s} [options]\n", .{ self.name, Cmd.command_raw_name }) catch {};
+            }
+
+            w.print("\n\n{s}Description{s}:\n", .{ bb, r }) catch {};
+            w.print("  {s}\n", .{Cmd.command_description}) catch {};
+
+            w.print("\n\n{s}Options{s}:\n", .{ bb, r }) catch {};
+            inline for (Cmd.command_opt_specs) |opt| {
+                w.print("  {s}{s}{s}", .{ bc, opt.raw, r }) catch {};
+                const used = 2 + opt.raw.len;
+                if (used < command_align_col) {
+                    writeSpacesAny(w, command_align_col - used);
+                } else {
+                    writeSpacesAny(w, 2);
+                }
+                w.print("{s}\n", .{opt.description}) catch {};
+            }
+
+            w.print("  -h, --help", .{}) catch {};
+            writeSpacesAny(w, command_align_col - (2 + "-h, --help".len));
+            w.print("Display this message\n", .{}) catch {};
+
+            if (self.version != null) {
+                w.print("  -v, --version", .{}) catch {};
+                writeSpacesAny(w, command_align_col - (2 + "-v, --version".len));
+                w.print("Display version number\n", .{}) catch {};
+            }
+
+            if (Cmd.command_examples.len > 0) {
+                w.print("\n\n{s}Examples{s}:\n", .{ bb, r }) catch {};
+                inline for (Cmd.command_examples) |example| {
+                    w.print("  {s}\n", .{example}) catch {};
+                }
+            }
+        }
     };
 }
 
@@ -506,7 +622,7 @@ test "parseOptions: parses flags and values" {
     };
     const OptsType = builder.buildOptionsType(&specs);
     const argv = [_][]const u8{ "--port", "3000", "--watch", "myfile.zig" };
-    const result = parseOptions(OptsType, &specs, &argv);
+    const result = try parseOptions(std.testing.allocator, OptsType, &specs, &argv);
 
     try std.testing.expectEqualStrings("3000", result.opts.port);
     try std.testing.expect(result.opts.watch);
@@ -521,7 +637,7 @@ test "parseOptions: short alias" {
     };
     const OptsType = builder.buildOptionsType(&specs);
     const argv = [_][]const u8{ "-p", "8080" };
-    const result = parseOptions(OptsType, &specs, &argv);
+    const result = try parseOptions(std.testing.allocator, OptsType, &specs, &argv);
 
     try std.testing.expectEqualStrings("8080", result.opts.port);
 }
@@ -532,7 +648,7 @@ test "parseOptions: double dash separator" {
     };
     const OptsType = builder.buildOptionsType(&specs);
     const argv = [_][]const u8{ "--watch", "--", "--extra", "stuff" };
-    const result = parseOptions(OptsType, &specs, &argv);
+    const result = try parseOptions(std.testing.allocator, OptsType, &specs, &argv);
 
     try std.testing.expect(result.opts.watch);
     try std.testing.expectEqual(@as(usize, 2), result.double_dash.len);
@@ -545,11 +661,36 @@ test "parseOptions: unknown option returns error" {
     };
     const OptsType = builder.buildOptionsType(&specs);
     const argv = [_][]const u8{ "--watch", "--unknown" };
-    const result = parseOptions(OptsType, &specs, &argv);
+    const result = try parseOptions(std.testing.allocator, OptsType, &specs, &argv);
 
     try std.testing.expect(result.err != null);
     try std.testing.expectEqual(.unknown_option, result.err.?.kind);
     try std.testing.expectEqualStrings("--unknown", result.err.?.token);
+}
+
+test "parseOptions: optionMany collects repeated values" {
+    const specs = [_]OptionSpec{
+        .{ .field_name = "modifier", .long_name = "modifier", .short = 0, .kind = .required, .description = "", .raw = "--modifier <key>", .multi = true },
+    };
+    const OptsType = builder.buildOptionsType(&specs);
+    var result = try parseOptions(std.testing.allocator, OptsType, &specs, &.{ "--modifier", "cmd", "--modifier", "shift" });
+    defer deinitOptions(OptsType, &specs, std.testing.allocator, &result.opts);
+
+    try std.testing.expect(result.err == null);
+    try std.testing.expectEqual(@as(usize, 2), result.opts.modifier.len);
+    try std.testing.expectEqualStrings("cmd", result.opts.modifier[0]);
+    try std.testing.expectEqualStrings("shift", result.opts.modifier[1]);
+}
+
+test "parseOptions: optional value accepts negative numbers" {
+    const specs = [_]OptionSpec{
+        .{ .field_name = "x", .long_name = "x", .short = 'x', .kind = .optional, .description = "", .raw = "-x [x]" },
+    };
+    const OptsType = builder.buildOptionsType(&specs);
+    const result = try parseOptions(std.testing.allocator, OptsType, &specs, &.{ "-x", "-10" });
+
+    try std.testing.expect(result.err == null);
+    try std.testing.expectEqualStrings("-10", result.opts.x.?);
 }
 
 // ─── Help output tests ───
@@ -826,6 +967,28 @@ test "help: short aliases displayed in options" {
     , help);
 }
 
+test "command help: includes examples" {
+    const Click = builder.cmd("click [target]", "Click at coordinates or target")
+        .optionMany("--modifier <key>", "Hold a modifier while clicking")
+        .example("myapp click -x 600 -y 400 --modifier option");
+
+    const noop = struct {
+        fn f(_: Click.Args, _: Click.Options) !void {}
+    }.f;
+
+    const ClickCmd = Click.bind(noop);
+
+    var app = App(.{ClickCmd}).init(std.testing.allocator, "myapp");
+    app.setVersion("1.0.0");
+
+    const help = try app.commandHelpString(ClickCmd, std.testing.allocator);
+    defer std.testing.allocator.free(help);
+
+    try std.testing.expect(std.mem.indexOf(u8, help, "Examples:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--modifier <key>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "myapp click -x 600 -y 400 --modifier option") != null);
+}
+
 // ─── Dispatch tests ───
 
 test "dispatch: matches command and passes args/options" {
@@ -998,7 +1161,7 @@ test "parseOptions: empty argv" {
     };
     const OptsType = builder.buildOptionsType(&specs);
     const argv = [_][]const u8{};
-    const result = parseOptions(OptsType, &specs, &argv);
+    const result = try parseOptions(std.testing.allocator, OptsType, &specs, &argv);
 
     try std.testing.expect(!result.opts.watch);
     try std.testing.expectEqual(@as(usize, 0), result.positional.len);
@@ -1009,7 +1172,7 @@ test "parseOptions: no specs, all positional" {
     const specs = [_]OptionSpec{};
     const OptsType = builder.buildOptionsType(&specs);
     const argv = [_][]const u8{ "foo", "bar", "baz" };
-    const result = parseOptions(OptsType, &specs, &argv);
+    const result = try parseOptions(std.testing.allocator, OptsType, &specs, &argv);
 
     try std.testing.expectEqual(@as(usize, 3), result.positional.len);
     try std.testing.expectEqualStrings("foo", result.positional[0]);
@@ -1022,7 +1185,7 @@ test "parseOptions: required option missing value" {
     };
     const OptsType = builder.buildOptionsType(&specs);
     const argv = [_][]const u8{"--port"};
-    const result = parseOptions(OptsType, &specs, &argv);
+    const result = try parseOptions(std.testing.allocator, OptsType, &specs, &argv);
 
     try std.testing.expect(result.err != null);
     try std.testing.expectEqual(.missing_value, result.err.?.kind);
@@ -1034,7 +1197,7 @@ test "parseOptions: optional flag without value stays null" {
     };
     const OptsType = builder.buildOptionsType(&specs);
     const argv = [_][]const u8{"--format"};
-    const result = parseOptions(OptsType, &specs, &argv);
+    const result = try parseOptions(std.testing.allocator, OptsType, &specs, &argv);
 
     try std.testing.expect(result.err == null);
     try std.testing.expectEqual(@as(?[]const u8, null), result.opts.format);
@@ -1046,7 +1209,7 @@ test "parseOptions: optional flag with value" {
     };
     const OptsType = builder.buildOptionsType(&specs);
     const argv = [_][]const u8{ "--format", "json" };
-    const result = parseOptions(OptsType, &specs, &argv);
+    const result = try parseOptions(std.testing.allocator, OptsType, &specs, &argv);
 
     try std.testing.expect(result.err == null);
     try std.testing.expectEqualStrings("json", result.opts.format.?);
@@ -1059,7 +1222,7 @@ test "parseOptions: mixed positional and options" {
     };
     const OptsType = builder.buildOptionsType(&specs);
     const argv = [_][]const u8{ "input.txt", "--verbose", "--out", "output.txt", "extra" };
-    const result = parseOptions(OptsType, &specs, &argv);
+    const result = try parseOptions(std.testing.allocator, OptsType, &specs, &argv);
 
     try std.testing.expect(result.err == null);
     try std.testing.expect(result.opts.verbose);
@@ -1075,7 +1238,7 @@ test "parseOptions: unknown short option returns error" {
     };
     const OptsType = builder.buildOptionsType(&specs);
     const argv = [_][]const u8{"-z"};
-    const result = parseOptions(OptsType, &specs, &argv);
+    const result = try parseOptions(std.testing.allocator, OptsType, &specs, &argv);
 
     try std.testing.expect(result.err != null);
     try std.testing.expectEqual(.unknown_option, result.err.?.kind);
@@ -1089,7 +1252,7 @@ test "parseOptions: double dash stops option parsing" {
     const OptsType = builder.buildOptionsType(&specs);
     // --verbose after -- should NOT be parsed as a flag
     const argv = [_][]const u8{ "--", "--verbose", "arg" };
-    const result = parseOptions(OptsType, &specs, &argv);
+    const result = try parseOptions(std.testing.allocator, OptsType, &specs, &argv);
 
     try std.testing.expect(!result.opts.verbose);
     try std.testing.expectEqual(@as(usize, 0), result.positional.len);

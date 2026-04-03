@@ -60,6 +60,8 @@ pub const OptionSpec = struct {
     description: []const u8,
     /// Raw option string as passed to .option()
     raw: []const u8,
+    /// Whether the option can be passed multiple times and collects values.
+    multi: bool = false,
 };
 
 /// Parse an option spec string like "--port <port>", "-p, --port <port>", "--verbose"
@@ -264,6 +266,16 @@ pub fn buildOptionsType(comptime opt_specs: []const OptionSpec) type {
                 };
             },
             .required => {
+                if (spec.multi) {
+                    fields[i] = .{
+                        .name = spec.field_name,
+                        .type = []const []const u8,
+                        .default_value_ptr = defaultPtr([]const []const u8, &[_][]const u8{}),
+                        .is_comptime = false,
+                        .alignment = @alignOf([]const []const u8),
+                    };
+                    continue;
+                }
                 fields[i] = .{
                     .name = spec.field_name,
                     .type = []const u8,
@@ -318,6 +330,33 @@ pub fn CommandBuilder(
         /// Add an option. Returns a new builder type with the additional field.
         pub fn option(comptime raw: []const u8, comptime desc: []const u8) type {
             const new_spec = comptime parseOptionSpec(raw, desc);
+            return CommandBuilder(
+                name_parts,
+                raw_name,
+                description,
+                arg_specs,
+                opt_specs ++ [1]OptionSpec{new_spec},
+                examples_list,
+            );
+        }
+
+        /// Add a repeatable option that collects every provided value.
+        pub fn optionMany(comptime raw: []const u8, comptime desc: []const u8) type {
+            const base_spec = comptime parseOptionSpec(raw, desc);
+            if (base_spec.kind != .required) {
+                @compileError("optionMany requires a required-value option like --item <value>");
+            }
+
+            const new_spec = OptionSpec{
+                .field_name = base_spec.field_name,
+                .long_name = base_spec.long_name,
+                .short = base_spec.short,
+                .kind = base_spec.kind,
+                .description = base_spec.description,
+                .raw = base_spec.raw,
+                .multi = true,
+            };
+
             return CommandBuilder(
                 name_parts,
                 raw_name,
@@ -644,4 +683,12 @@ test "bound command preserves all metadata" {
     try std.testing.expectEqualStrings("url", Bound.command_arg_specs[0].name);
     try std.testing.expectEqual(@as(usize, 1), Bound.command_opt_specs.len);
     try std.testing.expectEqual(@as(usize, 1), Bound.command_examples.len);
+}
+
+test "optionMany produces slice field" {
+    const Cmd = cmd("click", "Click")
+        .optionMany("--modifier <key>", "Repeatable modifier");
+
+    try std.testing.expect(@TypeOf(@as(Cmd.Options, undefined).modifier) == []const []const u8);
+    try std.testing.expect(Cmd.command_opt_specs[0].multi);
 }
