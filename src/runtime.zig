@@ -275,6 +275,7 @@ fn computeAlignColumn(comptime commands: anytype) usize {
 
 fn containsFlag(argv: []const []const u8, long: []const u8, short: []const u8) bool {
     for (argv) |arg| {
+        if (std.mem.eql(u8, arg, "--")) break;
         if (std.mem.eql(u8, arg, long) or std.mem.eql(u8, arg, short)) {
             return true;
         }
@@ -433,7 +434,18 @@ pub fn App(comptime commands: anytype) type {
                 return error.ParseError;
             }
 
-            const args = fillArgs(Cmd.Args, Cmd.command_arg_specs, parsed.positional);
+            const positional = if (parsed.double_dash.len == 0)
+                parsed.positional
+            else blk: {
+                var combined = try std.ArrayList([]const u8).initCapacity(self.allocator, parsed.positional.len + parsed.double_dash.len);
+                defer combined.deinit(self.allocator);
+                combined.appendSliceAssumeCapacity(parsed.positional);
+                combined.appendSliceAssumeCapacity(parsed.double_dash);
+                break :blk try combined.toOwnedSlice(self.allocator);
+            };
+            defer if (parsed.double_dash.len > 0) self.allocator.free(positional);
+
+            const args = fillArgs(Cmd.Args, Cmd.command_arg_specs, positional);
             if (args == null) {
                 const stderr = getStderr();
                 try stderr.print(boldRed("error:") ++ " missing required arguments for `{s}`\n", .{Cmd.command_raw_name});
@@ -1301,6 +1313,41 @@ test "fillArgs: variadic collects remaining args" {
     try std.testing.expectEqual(@as(usize, 3), args.?.rest.len);
     try std.testing.expectEqualStrings("a", args.?.rest[0]);
     try std.testing.expectEqualStrings("c", args.?.rest[2]);
+}
+
+test "dispatch: variadic args include double dash values" {
+    const Run = builder.cmd("run <...cmd>", "Run a command");
+
+    const capture = struct {
+        var seen: [2][]const u8 = undefined;
+
+        fn f(args: Run.Args, _: Run.Options) !void {
+            seen[0] = args.cmd[0];
+            seen[1] = args.cmd[1];
+        }
+    };
+
+    var app = App(.{Run.bind(capture.f)}).init(std.testing.allocator, "testapp");
+    try app.dispatch(&.{ "run", "--", "env", "--flag" });
+
+    try std.testing.expectEqualStrings("env", capture.seen[0]);
+    try std.testing.expectEqualStrings("--flag", capture.seen[1]);
+}
+
+test "dispatch: command help does not trigger after double dash" {
+    const Run = builder.cmd("run <...cmd>", "Run a command");
+
+    const capture = struct {
+        var count: usize = 0;
+
+        fn f(_: Run.Args, _: Run.Options) !void {
+            count += 1;
+        }
+    };
+
+    var app = App(.{Run.bind(capture.f)}).init(std.testing.allocator, "testapp");
+    try app.dispatch(&.{ "run", "--", "--help" });
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
 }
 
 test "fillArgs: variadic with no remaining args" {
