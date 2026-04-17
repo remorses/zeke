@@ -87,6 +87,36 @@ cmd("click [target]", "...")                    → T0  { Args={target:?str}, Op
 The two-step `.bind(fn)` pattern breaks circular dependencies: define the command
 first, write the action using its `.Args`/`.Options` types, then bind.
 
+## Memory and ownership
+
+zeke is designed to be allocation-minimal. Almost everything is **zero-copy slices
+into the original argv** from the OS.
+
+**What gets allocated at runtime:**
+
+| What | When | Freed by |
+|---|---|---|
+| `argsWithAllocator` internal buffer | `app.run()` | `defer arg_iter.deinit()` inside `run()` |
+| `optionMany` pointer slices | each repeated `--tag val` grows the slice | `defer deinitOptions()` after action returns |
+| Combined positional slice | only when `--` separator is used | `defer allocator.free()` after action returns |
+
+**All string values are borrowed, not copied.** The `[]const u8` fields in `Args`
+and `Options` are pointers into the argv buffer owned by `argsWithAllocator`. This
+means:
+
+- **Do not store `args.*` or `opts.*` pointers beyond your action function.** They
+  become dangling after `run()` returns. If you need to keep a value, copy it with
+  `allocator.dupe(u8, value)`.
+- For `optionMany`, the **slice of pointers** (`[]const []const u8`) is heap-allocated
+  and freed automatically, but the **strings inside** are still borrowed from argv.
+
+**Static limits:**
+
+- Max **1024 argv tokens** (after skipping argv[0]). Extras are silently dropped.
+- Max **512 positional args** per command. Extras are silently dropped.
+
+These are stack-allocated fixed buffers — no heap allocation for typical CLI usage.
+
 ## Features
 
 - **Comptime type generation** — `.option()` chain builds typed structs via `@Type`

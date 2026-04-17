@@ -144,7 +144,7 @@ fn parseOptions(
         }
     }
 
-    var positional_buf: [64][]const u8 = undefined;
+    var positional_buf: [512][]const u8 = undefined;
     var pos_count: usize = 0;
     var double_dash_start: ?usize = null;
 
@@ -313,7 +313,7 @@ pub fn App(comptime commands: anytype) type {
             var arg_iter = try std.process.argsWithAllocator(self.allocator);
             defer arg_iter.deinit();
 
-            var argv_buf: [256][]const u8 = undefined;
+            var argv_buf: [1024][]const u8 = undefined;
             var argc: usize = 0;
 
             _ = arg_iter.next(); // skip argv[0]
