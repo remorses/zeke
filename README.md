@@ -71,6 +71,32 @@ pub fn main() !void {
 }
 ```
 
+**Define global options once** when multiple commands share the same flag:
+
+```zig
+const Global = zeke.globalOpts()
+    .option("--json", "Output as JSON")
+    .option("--config [path]", "Config file");
+
+const Screenshot = zeke.cmd("screenshot [path]", "Take a screenshot")
+    .option("--region [region]", "Capture region");
+
+fn screenshotAction(
+    args: Screenshot.Args,
+    opts: Screenshot.Options,
+    global: Global.Options,
+) !void {
+    _ = .{ args, opts, global };
+}
+
+var app = zeke.AppWith(.{
+    Screenshot.bindWith(Global, screenshotAction),
+}, Global).init(gpa.allocator(), "myapp");
+```
+
+Global options are parsed from the full argv and shown **once** in top-level help,
+not repeated under every command.
+
 ## How it works
 
 Each `.option()` call returns a **different comptime type** with one more struct
@@ -124,6 +150,7 @@ These are stack-allocated fixed buffers — no heap allocation for typical CLI u
 - **Space-separated subcommands** — `mouse move`, `clipboard get` with longest-match dispatch
 - **Short aliases** — `-p, --port <port>` or `-x [x]`
 - **Repeatable value options** — `.optionMany("--tag <tag>", ...)` collects `--tag` values into a slice
+- **Global options** — `globalOpts()` + `AppWith()` share typed flags across commands
 - **Positional args** — `<required>`, `[optional]`, `[...variadic]`
 - **Auto help** — `--help` / `-h` with aligned columns and ANSI colors
 - **Command help** — `myapp serve --help` shows help for that command, including examples
@@ -154,7 +181,7 @@ These are stack-allocated fixed buffers — no heap allocation for typical CLI u
 
 See [`example/main.zig`](example/main.zig) for a usecomputer-style CLI with 9
 commands including space-separated subcommands (`mouse move`, `display list`,
-`clipboard get/set`).
+`clipboard get/set`) and a shared global `--json` option.
 
 ```
 $ myapp --help
@@ -169,7 +196,6 @@ Commands:
     --region [region]          Capture specific region (x,y,w,h)
     --display [id]             Target display
     --annotate                 Annotate with grid overlay
-    --json                     Output as JSON
   click [target]               Click at coordinates or target
     -x [x]                     X coordinate
     -y [y]                     Y coordinate
@@ -184,6 +210,7 @@ Commands:
 Options:
   -h, --help     Display this message
   -v, --version  Display version number
+  --json         Output as JSON
 ```
 
 ## License
