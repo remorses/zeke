@@ -189,6 +189,63 @@ fn parseOptions(
     };
 }
 
+fn parseGlobalOptions(
+    allocator: std.mem.Allocator,
+    comptime OptsType: type,
+    comptime opt_specs: []const OptionSpec,
+    tokens: []const []const u8,
+) !struct { opts: OptsType, filtered: []const []const u8, err: ?ParseError } {
+    var opts: OptsType = undefined;
+    inline for (opt_specs) |spec| {
+        switch (spec.kind) {
+            .flag => {
+                @field(opts, spec.field_name) = false;
+            },
+            .optional => {
+                @field(opts, spec.field_name) = null;
+            },
+            .required => {},
+        }
+        if (spec.multi) {
+            @field(opts, spec.field_name) = &[_][]const u8{};
+        }
+    }
+
+    var filtered = std.ArrayList([]const u8).empty;
+    defer filtered.deinit(allocator);
+    try filtered.ensureTotalCapacity(allocator, tokens.len);
+
+    var i: usize = 0;
+    while (i < tokens.len) {
+        const token = tokens[i];
+
+        if (std.mem.eql(u8, token, "--")) {
+            try filtered.appendSlice(allocator, tokens[i..]);
+            break;
+        }
+
+        if (opt_specs.len > 0) {
+            if (matchOptionToken(opt_specs, token)) |match| {
+                const consumed = try setOptionField(allocator, OptsType, opt_specs, &opts, match.index, tokens, i);
+                if (consumed == 0) {
+                    return .{ .opts = opts, .filtered = &.{}, .err = .{ .kind = .missing_value, .token = token } };
+                }
+                i += consumed;
+                continue;
+            }
+        }
+
+        try filtered.append(allocator, token);
+        i += 1;
+    }
+
+    return .{
+        .opts = opts,
+        .filtered = try filtered.toOwnedSlice(allocator),
+        .err = null,
+    };
+}
+
 fn deinitOptions(
     comptime OptsType: type,
     comptime opt_specs: []const OptionSpec,
@@ -248,7 +305,7 @@ fn writeSpacesAny(w: anytype, count: usize) void {
 
 /// Compute the single shared alignment column across all commands and their
 /// options. This matches goke's behavior: one column for ALL descriptions.
-fn computeAlignColumn(comptime commands: anytype) usize {
+fn computeAlignColumn(comptime commands: anytype, comptime global_opt_specs: []const OptionSpec) usize {
     comptime {
         var max: usize = 0;
         for (commands) |Cmd| {
@@ -262,11 +319,15 @@ fn computeAlignColumn(comptime commands: anytype) usize {
                 if (opt_width > max) max = opt_width;
             }
         }
-        // Also account for global options
         const help_width = 2 + "-h, --help".len;
         if (help_width > max) max = help_width;
         const version_width = 2 + "-v, --version".len;
         if (version_width > max) max = version_width;
+
+        for (global_opt_specs) |opt| {
+            const opt_width = 2 + opt.raw.len;
+            if (opt_width > max) max = opt_width;
+        }
 
         // Add 2 for the gap between name column and description column
         return max + 2;
@@ -286,7 +347,13 @@ fn containsFlag(argv: []const []const u8, long: []const u8, short: []const u8) b
 // ─── App type factory ───
 
 pub fn App(comptime commands: anytype) type {
-    const align_col = computeAlignColumn(commands);
+    return AppWith(commands, builder.globalOpts());
+}
+
+pub fn AppWith(comptime commands: anytype, comptime Global: type) type {
+    const global_opt_specs = Global.global_opt_specs;
+    const GlobalOptions = Global.Options;
+    const align_col = computeAlignColumn(commands, global_opt_specs);
 
     return struct {
         const Self = @This();
@@ -340,6 +407,25 @@ pub fn App(comptime commands: anytype) type {
                 return;
             }
 
+            var parsed_global = try parseGlobalOptions(self.allocator, GlobalOptions, global_opt_specs, argv);
+            defer self.allocator.free(parsed_global.filtered);
+            defer deinitOptions(GlobalOptions, global_opt_specs, self.allocator, &parsed_global.opts);
+
+            if (parsed_global.err) |parse_err| {
+                const stderr = getStderr();
+                switch (parse_err.kind) {
+                    .missing_value => {
+                        try stderr.print(boldRed("error:") ++ " option `{s}` value is missing\n", .{parse_err.token});
+                    },
+                    .unknown_option => {
+                        try stderr.print(boldRed("error:") ++ " Unknown option `{s}`\n", .{parse_err.token});
+                    },
+                }
+                return error.ParseError;
+            }
+
+            const dispatch_argv = parsed_global.filtered;
+
             // Find longest matching command name
             var best_match_len: usize = 0;
             var matched = false;
@@ -350,10 +436,10 @@ pub fn App(comptime commands: anytype) type {
                     has_default_command = true;
                 }
                 const name_parts = Cmd.command_name_parts;
-                if (name_parts.len > best_match_len and name_parts.len <= argv.len) {
+                if (name_parts.len > best_match_len and name_parts.len <= dispatch_argv.len) {
                     var all_match = true;
                     inline for (name_parts, 0..) |part, pi| {
-                        if (pi >= argv.len or !std.mem.eql(u8, argv[pi], part)) {
+                        if (pi >= dispatch_argv.len or !std.mem.eql(u8, dispatch_argv[pi], part)) {
                             all_match = false;
                         }
                     }
@@ -370,18 +456,18 @@ pub fn App(comptime commands: anytype) type {
                     if (name_parts.len == best_match_len and !matched) {
                         var all_match = true;
                         inline for (name_parts, 0..) |part, pi| {
-                            if (pi >= argv.len or !std.mem.eql(u8, argv[pi], part)) {
+                            if (pi >= dispatch_argv.len or !std.mem.eql(u8, dispatch_argv[pi], part)) {
                                 all_match = false;
                             }
                         }
                         if (all_match) {
                             matched = true;
-                            const remaining = argv[name_parts.len..];
+                            const remaining = dispatch_argv[name_parts.len..];
                             if (containsFlag(remaining, "--help", "-h")) {
                                 self.outputCommandHelp(Cmd);
                                 return;
                             }
-                            try self.dispatchCommand(Cmd, remaining);
+                            try self.dispatchCommand(Cmd, remaining, parsed_global.opts);
                             return;
                         }
                     }
@@ -393,11 +479,11 @@ pub fn App(comptime commands: anytype) type {
                 inline for (commands) |Cmd| {
                     if (Cmd.command_name_parts.len == 0 and !matched) {
                         matched = true;
-                        if (containsFlag(argv, "--help", "-h")) {
+                        if (containsFlag(dispatch_argv, "--help", "-h")) {
                             self.outputCommandHelp(Cmd);
                             return;
                         }
-                        try self.dispatchCommand(Cmd, argv);
+                        try self.dispatchCommand(Cmd, dispatch_argv, parsed_global.opts);
                         return;
                     }
                 }
@@ -405,11 +491,11 @@ pub fn App(comptime commands: anytype) type {
 
             // Nothing matched
             if (!matched) {
-                if (argv.len == 0 or has_default_command) {
+                if (dispatch_argv.len == 0 or has_default_command) {
                     self.outputHelp();
                 } else {
                     const stderr = getStderr();
-                    stderr.print(boldRed("error:") ++ " unknown command `{s}`\n", .{argv[0]}) catch {};
+                    stderr.print(boldRed("error:") ++ " unknown command `{s}`\n", .{dispatch_argv[0]}) catch {};
                     if (self.help_enabled) {
                         stderr.print("Run \"{s} --help\" for usage information.\n", .{self.name}) catch {};
                     }
@@ -417,7 +503,7 @@ pub fn App(comptime commands: anytype) type {
             }
         }
 
-        fn dispatchCommand(self: *Self, comptime Cmd: type, remaining: []const []const u8) !void {
+        fn dispatchCommand(self: *Self, comptime Cmd: type, remaining: []const []const u8, global_opts: GlobalOptions) !void {
             var parsed = try parseOptions(self.allocator, Cmd.Options, Cmd.command_opt_specs, remaining);
             defer deinitOptions(Cmd.Options, Cmd.command_opt_specs, self.allocator, &parsed.opts);
 
@@ -452,7 +538,11 @@ pub fn App(comptime commands: anytype) type {
                 return error.MissingRequiredArg;
             }
 
-            try Cmd.invoke(args.?, parsed.opts);
+            if (Cmd.has_global) {
+                try Cmd.invoke(args.?, parsed.opts, global_opts);
+            } else {
+                try Cmd.invoke(args.?, parsed.opts);
+            }
         }
 
         pub fn outputVersion(self: *Self) void {
@@ -560,6 +650,17 @@ pub fn App(comptime commands: anytype) type {
                 writeSpacesAny(w, align_col - (2 + "-v, --version".len));
                 w.print("Display version number\n", .{}) catch {};
             }
+
+            inline for (global_opt_specs) |opt| {
+                w.print("  {s}", .{opt.raw}) catch {};
+                const used = 2 + opt.raw.len;
+                if (used < align_col) {
+                    writeSpacesAny(w, align_col - used);
+                } else {
+                    writeSpacesAny(w, 2);
+                }
+                w.print("{s}\n", .{opt.description}) catch {};
+            }
         }
 
         fn writeCommandHelp(self: *Self, comptime Cmd: type, w: anytype, comptime ansi: bool) void {
@@ -612,6 +713,10 @@ pub fn App(comptime commands: anytype) type {
                 w.print("  -v, --version", .{}) catch {};
                 writeSpacesAny(w, command_align_col - (2 + "-v, --version".len));
                 w.print("Display version number\n", .{}) catch {};
+            }
+
+            if (global_opt_specs.len > 0) {
+                w.print("\n  See `{s} --help` for global options.\n", .{self.name}) catch {};
             }
 
             if (Cmd.command_examples.len > 0) {
@@ -678,6 +783,23 @@ test "parseOptions: unknown option returns error" {
     try std.testing.expect(result.err != null);
     try std.testing.expectEqual(.unknown_option, result.err.?.kind);
     try std.testing.expectEqualStrings("--unknown", result.err.?.token);
+}
+
+test "parseGlobalOptions extracts globals and leaves command tokens" {
+    const Global = builder.globalOpts()
+        .option("--json", "Output as JSON")
+        .option("--config [path]", "Config path");
+
+    var result = try parseGlobalOptions(std.testing.allocator, Global.Options, Global.global_opt_specs, &.{ "serve", "--json", "--config", "dev.toml", "src.zig" });
+    defer std.testing.allocator.free(result.filtered);
+    defer deinitOptions(Global.Options, Global.global_opt_specs, std.testing.allocator, &result.opts);
+
+    try std.testing.expect(result.err == null);
+    try std.testing.expect(result.opts.json);
+    try std.testing.expectEqualStrings("dev.toml", result.opts.config.?);
+    try std.testing.expectEqual(@as(usize, 2), result.filtered.len);
+    try std.testing.expectEqualStrings("serve", result.filtered[0]);
+    try std.testing.expectEqualStrings("src.zig", result.filtered[1]);
 }
 
 test "parseOptions: optionMany collects repeated values" {
@@ -979,6 +1101,34 @@ test "help: short aliases displayed in options" {
     , help);
 }
 
+test "help: AppWith shows global options once" {
+    const Global = builder.globalOpts()
+        .option("--json", "Output as JSON")
+        .option("--config [path]", "Config path");
+    const Screenshot = builder.cmd("screenshot [path]", "Take a screenshot")
+        .option("--region [region]", "Capture region");
+    const Display = builder.cmd("display list", "List displays");
+
+    const n1 = struct {
+        fn f(_: Screenshot.Args, _: Screenshot.Options, _: Global.Options) !void {}
+    }.f;
+    const n2 = struct {
+        fn f(_: Display.Args, _: Display.Options, _: Global.Options) !void {}
+    }.f;
+
+    var app = AppWith(.{
+        Screenshot.bindWith(Global, n1),
+        Display.bindWith(Global, n2),
+    }, Global).init(std.testing.allocator, "uc");
+
+    const help = try app.helpString(std.testing.allocator);
+    defer std.testing.allocator.free(help);
+
+    try std.testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, help, "    --json"));
+    try std.testing.expect(std.mem.indexOf(u8, help, "  --json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "  --config [path]") != null);
+}
+
 test "command help: includes examples" {
     const Click = builder.cmd("click [target]", "Click at coordinates or target")
         .optionMany("--modifier <key>", "Hold a modifier while clicking")
@@ -999,6 +1149,26 @@ test "command help: includes examples" {
     try std.testing.expect(std.mem.indexOf(u8, help, "Examples:") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--modifier <key>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "myapp click -x 600 -y 400 --modifier option") != null);
+}
+
+test "command help: global options are not repeated" {
+    const Global = builder.globalOpts().option("--json", "Output as JSON");
+    const Screenshot = builder.cmd("screenshot [path]", "Take a screenshot")
+        .option("--region [region]", "Capture region");
+
+    const noop = struct {
+        fn f(_: Screenshot.Args, _: Screenshot.Options, _: Global.Options) !void {}
+    }.f;
+    const ScreenshotCmd = Screenshot.bindWith(Global, noop);
+
+    var app = AppWith(.{ScreenshotCmd}, Global).init(std.testing.allocator, "uc");
+
+    const help = try app.commandHelpString(ScreenshotCmd, std.testing.allocator);
+    defer std.testing.allocator.free(help);
+
+    try std.testing.expect(std.mem.indexOf(u8, help, "--region [region]") != null);
+    try std.testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, help, "--json"));
+    try std.testing.expect(std.mem.indexOf(u8, help, "See `uc --help` for global options.") != null);
 }
 
 // ─── Dispatch tests ───
@@ -1094,6 +1264,72 @@ test "dispatch: default command receives options" {
     var app = App(.{Root.bind(action.f)}).init(std.testing.allocator, "test");
     try app.dispatch(&.{ "--env", "staging" });
     try std.testing.expectEqualStrings("staging", env_val);
+}
+
+test "dispatch: global options passed to bindWith action" {
+    const Global = builder.globalOpts()
+        .option("--json", "Output as JSON")
+        .option("--config [path]", "Config path");
+    const Serve = builder.cmd("serve <entry>", "Start server")
+        .option("--watch", "Watch mode");
+
+    var seen_json = false;
+    var seen_config: ?[]const u8 = null;
+    var seen_watch = false;
+    var seen_entry: []const u8 = "";
+
+    const action = struct {
+        var json_ptr: *bool = undefined;
+        var config_ptr: *?[]const u8 = undefined;
+        var watch_ptr: *bool = undefined;
+        var entry_ptr: *[]const u8 = undefined;
+
+        fn f(args: Serve.Args, opts: Serve.Options, global: Global.Options) !void {
+            entry_ptr.* = args.entry;
+            watch_ptr.* = opts.watch;
+            json_ptr.* = global.json;
+            config_ptr.* = global.config;
+        }
+    };
+    action.json_ptr = &seen_json;
+    action.config_ptr = &seen_config;
+    action.watch_ptr = &seen_watch;
+    action.entry_ptr = &seen_entry;
+
+    var app = AppWith(.{Serve.bindWith(Global, action.f)}, Global).init(std.testing.allocator, "myapp");
+    try app.dispatch(&.{ "serve", "--json", "main.zig", "--watch", "--config", "dev.toml" });
+
+    try std.testing.expectEqualStrings("main.zig", seen_entry);
+    try std.testing.expect(seen_watch);
+    try std.testing.expect(seen_json);
+    try std.testing.expectEqualStrings("dev.toml", seen_config.?);
+}
+
+test "dispatch: AppWith works with regular bind commands too" {
+    const Global = builder.globalOpts().option("--json", "Output as JSON");
+    const Status = builder.cmd("status", "Show status")
+        .option("--verbose", "Verbose output");
+
+    var called = false;
+    var verbose = false;
+
+    const action = struct {
+        var called_ptr: *bool = undefined;
+        var verbose_ptr: *bool = undefined;
+
+        fn f(_: Status.Args, opts: Status.Options) !void {
+            called_ptr.* = true;
+            verbose_ptr.* = opts.verbose;
+        }
+    };
+    action.called_ptr = &called;
+    action.verbose_ptr = &verbose;
+
+    var app = AppWith(.{Status.bind(action.f)}, Global).init(std.testing.allocator, "myapp");
+    try app.dispatch(&.{ "status", "--json", "--verbose" });
+
+    try std.testing.expect(called);
+    try std.testing.expect(verbose);
 }
 
 test "dispatch: named command takes priority over default" {

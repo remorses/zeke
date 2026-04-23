@@ -304,6 +304,39 @@ pub fn buildOptionsType(comptime opt_specs: []const OptionSpec) type {
     } });
 }
 
+/// Comptime global options builder. Mirrors CommandBuilder's option APIs but
+/// only produces a typed global Options struct with shared option metadata.
+pub fn GlobalOptsBuilder(comptime opt_specs: []const OptionSpec) type {
+    return struct {
+        pub const Options = buildOptionsType(opt_specs);
+        pub const global_opt_specs = opt_specs;
+
+        pub fn option(comptime raw: []const u8, comptime desc: []const u8) type {
+            const new_spec = comptime parseOptionSpec(raw, desc);
+            return GlobalOptsBuilder(opt_specs ++ [1]OptionSpec{new_spec});
+        }
+
+        pub fn optionMany(comptime raw: []const u8, comptime desc: []const u8) type {
+            const base_spec = comptime parseOptionSpec(raw, desc);
+            if (base_spec.kind != .required) {
+                @compileError("optionMany requires a required-value option like --item <value>");
+            }
+
+            const new_spec = OptionSpec{
+                .field_name = base_spec.field_name,
+                .long_name = base_spec.long_name,
+                .short = base_spec.short,
+                .kind = base_spec.kind,
+                .description = base_spec.description,
+                .raw = base_spec.raw,
+                .multi = true,
+            };
+
+            return GlobalOptsBuilder(opt_specs ++ [1]OptionSpec{new_spec});
+        }
+    };
+}
+
 // ─── CommandBuilder ───
 
 /// Comptime command builder. Returned by `cmd()`, each `.option()` call returns
@@ -393,6 +426,26 @@ pub fn CommandBuilder(
                 action_fn,
             );
         }
+
+        /// Finalize the command by binding an action function that also receives
+        /// a typed global options struct.
+        pub fn bindWith(
+            comptime Global: type,
+            comptime action_fn: *const fn (Args, Options, Global.Options) anyerror!void,
+        ) type {
+            return BoundCommandWithGlobal(
+                name_parts,
+                raw_name,
+                description,
+                arg_specs,
+                opt_specs,
+                examples_list,
+                Args,
+                Options,
+                Global.Options,
+                action_fn,
+            );
+        }
     };
 }
 
@@ -411,6 +464,7 @@ fn BoundCommand(
     return struct {
         pub const Args = ArgsType;
         pub const Options = OptsType;
+        pub const has_global = false;
         pub const command_name_parts = name_parts;
         pub const command_raw_name = raw_name;
         pub const command_description = description;
@@ -420,6 +474,37 @@ fn BoundCommand(
 
         pub fn invoke(args: Args, opts: Options) anyerror!void {
             return action_fn(args, opts);
+        }
+    };
+}
+
+/// A command with its action bound plus a typed global options parameter.
+fn BoundCommandWithGlobal(
+    comptime name_parts: []const []const u8,
+    comptime raw_name: []const u8,
+    comptime description: []const u8,
+    comptime arg_specs: []const ArgSpec,
+    comptime opt_specs: []const OptionSpec,
+    comptime examples_list: []const []const u8,
+    comptime ArgsType: type,
+    comptime OptsType: type,
+    comptime GlobalOptsType: type,
+    comptime action_fn: *const fn (ArgsType, OptsType, GlobalOptsType) anyerror!void,
+) type {
+    return struct {
+        pub const Args = ArgsType;
+        pub const Options = OptsType;
+        pub const GlobalOptions = GlobalOptsType;
+        pub const has_global = true;
+        pub const command_name_parts = name_parts;
+        pub const command_raw_name = raw_name;
+        pub const command_description = description;
+        pub const command_arg_specs = arg_specs;
+        pub const command_opt_specs = opt_specs;
+        pub const command_examples = examples_list;
+
+        pub fn invoke(args: Args, opts: Options, global: GlobalOptions) anyerror!void {
+            return action_fn(args, opts, global);
         }
     };
 }
@@ -437,6 +522,11 @@ pub fn cmd(comptime raw_name: []const u8, comptime description: []const u8) type
         &[_]OptionSpec{},
         &[_][]const u8{},
     );
+}
+
+/// Start building a global options definition shared across commands.
+pub fn globalOpts() type {
+    return GlobalOptsBuilder(&[_]OptionSpec{});
 }
 
 // ─── Tests ───
@@ -691,4 +781,36 @@ test "optionMany produces slice field" {
 
     try std.testing.expect(@TypeOf(@as(Cmd.Options, undefined).modifier) == []const []const u8);
     try std.testing.expect(Cmd.command_opt_specs[0].multi);
+}
+
+test "globalOpts builder chain produces correct types" {
+    const Global = globalOpts()
+        .option("--json", "Output as JSON")
+        .option("--config [path]", "Config path")
+        .optionMany("--tag <tag>", "Repeatable tag");
+
+    try std.testing.expect(@TypeOf(@as(Global.Options, undefined).json) == bool);
+    try std.testing.expect(@TypeOf(@as(Global.Options, undefined).config) == ?[]const u8);
+    try std.testing.expect(@TypeOf(@as(Global.Options, undefined).tag) == []const []const u8);
+    try std.testing.expectEqual(@as(usize, 3), Global.global_opt_specs.len);
+}
+
+test "bindWith preserves command and global metadata" {
+    const Global = globalOpts().option("--verbose", "Verbose output");
+    const Cmd = cmd("serve <entry>", "Start server")
+        .option("--watch", "Watch mode");
+
+    const action = struct {
+        fn run(args: Cmd.Args, opts: Cmd.Options, global: Global.Options) !void {
+            _ = args;
+            _ = opts;
+            _ = global;
+        }
+    }.run;
+
+    const Bound = Cmd.bindWith(Global, action);
+    try std.testing.expect(Bound.has_global);
+    try std.testing.expect(@TypeOf(Bound.invoke) == fn (Bound.Args, Bound.Options, Bound.GlobalOptions) anyerror!void);
+    try std.testing.expectEqualStrings("serve <entry>", Bound.command_raw_name);
+    try std.testing.expectEqual(@as(usize, 1), Bound.command_opt_specs.len);
 }

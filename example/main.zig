@@ -8,11 +8,13 @@ fn getStdout() std.fs.File.DeprecatedWriter {
 
 // ─── Command definitions ───
 
+const Global = zeke.globalOpts()
+    .option("--json", "Output as JSON");
+
 const Screenshot = zeke.cmd("screenshot [path]", "Take a screenshot")
     .option("--region [region]", "Capture specific region (x,y,w,h)")
     .option("--display [id]", "Target display")
-    .option("--annotate", "Annotate with grid overlay")
-    .option("--json", "Output as JSON");
+    .option("--annotate", "Annotate with grid overlay");
 
 const Click = zeke.cmd("click [target]", "Click at coordinates or target")
     .option("-x [x]", "X coordinate")
@@ -31,11 +33,9 @@ const Scroll = zeke.cmd("scroll <direction> [amount]", "Scroll in a direction")
 const MouseMove = zeke.cmd("mouse move [x] [y]", "Move to absolute coordinates")
     .option("--coord-map [map]", "Coordinate mapping");
 
-const MousePosition = zeke.cmd("mouse position", "Print current mouse position")
-    .option("--json", "Output as JSON");
+const MousePosition = zeke.cmd("mouse position", "Print current mouse position");
 
-const DisplayList = zeke.cmd("display list", "List connected displays")
-    .option("--json", "Output as JSON");
+const DisplayList = zeke.cmd("display list", "List connected displays");
 
 const ClipboardGet = zeke.cmd("clipboard get", "Print clipboard text");
 
@@ -43,9 +43,9 @@ const ClipboardSet = zeke.cmd("clipboard set <text>", "Set clipboard text");
 
 // ─── Action functions (typed) ───
 
-fn screenshotAction(args: Screenshot.Args, opts: Screenshot.Options) !void {
+fn screenshotAction(args: Screenshot.Args, opts: Screenshot.Options, global: Global.Options) !void {
     const stdout = getStdout();
-    if (opts.json) {
+    if (global.json) {
         try stdout.print("{{\"action\":\"screenshot\",\"path\":\"{?s}\"}}\n", .{args.path});
     } else {
         try stdout.print("Taking screenshot", .{});
@@ -62,7 +62,7 @@ fn screenshotAction(args: Screenshot.Args, opts: Screenshot.Options) !void {
     }
 }
 
-fn clickAction(args: Click.Args, opts: Click.Options) !void {
+fn clickAction(args: Click.Args, opts: Click.Options, _: Global.Options) !void {
     const stdout = getStdout();
     const button = opts.button orelse "left";
     const count = opts.count orelse "1";
@@ -81,7 +81,7 @@ fn clickAction(args: Click.Args, opts: Click.Options) !void {
     try stdout.writeByte('\n');
 }
 
-fn pressAction(args: Press.Args, opts: Press.Options) !void {
+fn pressAction(args: Press.Args, opts: Press.Options, _: Global.Options) !void {
     const stdout = getStdout();
     const count = opts.count orelse "1";
     try stdout.print("Press '{s}' x{s}\n", .{ args.key, count });
@@ -90,7 +90,7 @@ fn pressAction(args: Press.Args, opts: Press.Options) !void {
     }
 }
 
-fn scrollAction(args: Scroll.Args, opts: Scroll.Options) !void {
+fn scrollAction(args: Scroll.Args, opts: Scroll.Options, _: Global.Options) !void {
     const stdout = getStdout();
     try stdout.print("Scroll {s}", .{args.direction});
     if (args.amount) |a| {
@@ -102,7 +102,7 @@ fn scrollAction(args: Scroll.Args, opts: Scroll.Options) !void {
     try stdout.writeByte('\n');
 }
 
-fn mouseMoveAction(args: MouseMove.Args, opts: MouseMove.Options) !void {
+fn mouseMoveAction(args: MouseMove.Args, opts: MouseMove.Options, _: Global.Options) !void {
     const stdout = getStdout();
     try stdout.print("Mouse move", .{});
     if (args.x) |x| {
@@ -115,30 +115,30 @@ fn mouseMoveAction(args: MouseMove.Args, opts: MouseMove.Options) !void {
     try stdout.writeByte('\n');
 }
 
-fn mousePositionAction(_: MousePosition.Args, opts: MousePosition.Options) !void {
+fn mousePositionAction(_: MousePosition.Args, _: MousePosition.Options, global: Global.Options) !void {
     const stdout = getStdout();
-    if (opts.json) {
+    if (global.json) {
         try stdout.print("{{\"x\":100,\"y\":200}}\n", .{});
     } else {
         try stdout.print("Position: 100, 200\n", .{});
     }
 }
 
-fn displayListAction(_: DisplayList.Args, opts: DisplayList.Options) !void {
+fn displayListAction(_: DisplayList.Args, _: DisplayList.Options, global: Global.Options) !void {
     const stdout = getStdout();
-    if (opts.json) {
+    if (global.json) {
         try stdout.print("[{{\"id\":1,\"name\":\"Main\"}}]\n", .{});
     } else {
         try stdout.print("1: Main (2560x1440)\n", .{});
     }
 }
 
-fn clipboardGetAction(_: ClipboardGet.Args, _: ClipboardGet.Options) !void {
+fn clipboardGetAction(_: ClipboardGet.Args, _: ClipboardGet.Options, _: Global.Options) !void {
     const stdout = getStdout();
     try stdout.print("(clipboard contents)\n", .{});
 }
 
-fn clipboardSetAction(args: ClipboardSet.Args, _: ClipboardSet.Options) !void {
+fn clipboardSetAction(args: ClipboardSet.Args, _: ClipboardSet.Options, _: Global.Options) !void {
     const stdout = getStdout();
     try stdout.print("Clipboard set to: {s}\n", .{args.text});
 }
@@ -149,17 +149,17 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    var app = zeke.App(.{
-        Screenshot.bind(screenshotAction),
-        Click.bind(clickAction),
-        Press.bind(pressAction),
-        Scroll.bind(scrollAction),
-        MouseMove.bind(mouseMoveAction),
-        MousePosition.bind(mousePositionAction),
-        DisplayList.bind(displayListAction),
-        ClipboardGet.bind(clipboardGetAction),
-        ClipboardSet.bind(clipboardSetAction),
-    }).init(gpa.allocator(), "usecomputer");
+    var app = zeke.AppWith(.{
+        Screenshot.bindWith(Global, screenshotAction),
+        Click.bindWith(Global, clickAction),
+        Press.bindWith(Global, pressAction),
+        Scroll.bindWith(Global, scrollAction),
+        MouseMove.bindWith(Global, mouseMoveAction),
+        MousePosition.bindWith(Global, mousePositionAction),
+        DisplayList.bindWith(Global, displayListAction),
+        ClipboardGet.bindWith(Global, clipboardGetAction),
+        ClipboardSet.bindWith(Global, clipboardSetAction),
+    }, Global).init(gpa.allocator(), "usecomputer");
 
     app.setVersion("0.1.0");
     try app.run();

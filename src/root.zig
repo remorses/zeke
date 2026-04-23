@@ -24,7 +24,9 @@ const builder = @import("builder.zig");
 const runtime = @import("runtime.zig");
 
 pub const cmd = builder.cmd;
+pub const globalOpts = builder.globalOpts;
 pub const App = runtime.App;
+pub const AppWith = runtime.AppWith;
 
 pub const OptionKind = builder.OptionKind;
 pub const OptionSpec = builder.OptionSpec;
